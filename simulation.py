@@ -3,17 +3,18 @@ import math
 import matplotlib.pyplot as plt
 import os
 import csv
-
 # ----------------------------------------------------
 RADIUS = 1.0                    # km
 NUM_CHANNELS = 8
 PACKET_DURATION = 0.050         # 50 ms
 MEAN_INTERARRIVAL = 600         # seconds per device
-TOTAL_PACKETS = 10000
+TOTAL_PACKETS = 300000
+
 
 success_distances = []
 failure_distances = []
 DATASET_FILE = "channel_training_data.csv"
+USE_ML = False   # or True
 
 # Global statistics for dynamic channel selection
 channel_stats = {
@@ -34,24 +35,49 @@ def reset_channel_stats():
             'collisions': 0,
             'successes': 0
         }
+if USE_ML:
+    def initialize_dataset():
+        if not os.path.exists(DATASET_FILE):
+            with open(DATASET_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "time", 
+                    "channel",
+                    "lru_score", 
+                    "load_score", 
+                    "collision_score",
+                    "score",
+                    "probability",
+                    "success",
+                    "distance",
+                    "rx",
+                    "alpha", "beta", "gamma", "lambda"
+                ])
 
-def initialize_dataset():
-    if not os.path.exists(DATASET_FILE):
-        with open(DATASET_FILE, "w", newline="") as f:
+    def append_training_data(
+            time, channel, lru_score, load_score, collision_score,
+            score, probability, success, distance, rx):
+
+        header = [
+            "time","channel",
+            "lru_score","load_score","collision_score",
+            "score","probability","success",
+            "distance","rx"
+        ]
+
+        new_file = not os.path.exists(DATASET_FILE)
+
+        with open(DATASET_FILE, "a", newline="") as f:
             writer = csv.writer(f)
+            if new_file:
+                writer.writerow(header)
             writer.writerow([
-                "time", 
-                "channel",
-                "lru_score", 
-                "load_score", 
-                "collision_score",
-                "score",
-                "probability",
-                "success",
-                "distance",
-                "rx",
-                "alpha", "beta", "gamma", "lambda"
+                time, channel,
+                lru_score, load_score, collision_score,
+                score, probability, success,
+                distance, rx
             ])
+
 # ----------------------------------------------------
 # DEVICE GENERATION
 # ----------------------------------------------------
@@ -174,7 +200,7 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
         allowed = cluster_channels[cluster_id]
 
         # 2. Choose channel dynamically
-        channel = select_channel_fn(allowed, t)
+        channel, feat, score, prob = select_channel_fn(allowed, t)
 
         # 3. Remove expired (finished) packets from this channel
         ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
@@ -188,6 +214,22 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
 
         # 6. Check collision/capture
         ok = check_collision(ongoing[channel], t, end_t, RX[dev])
+        
+        
+
+        if USE_ML:
+            append_training_data(
+                time=t,
+                channel=channel,
+                lru_score=feat[0],
+                load_score=feat[1],
+                collision_score=feat[2],
+                score=score,
+                probability=prob,
+                success=int(ok),
+                distance=d_dev,
+                rx=RX[dev]
+            )
 
         if ok:
             success += 1

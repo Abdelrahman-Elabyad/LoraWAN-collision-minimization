@@ -2,11 +2,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import csv
-from clustering_channel_assignment import assign_clusters_distance_based, dynamic_select
-from simulation import run_simulation, generate_devices, generate_arrivals, check_collision, PACKET_DURATION, TOTAL_PACKETS, NUM_CHANNELS
+from clustering_channel_assignment import assign_clusters_quantile_stratified, dynamic_select
+from simulation import run_simulation, generate_devices, generate_arrivals, check_collision, PACKET_DURATION, TOTAL_PACKETS, NUM_CHANNELS, channel_stats, DATASET_FILE, USE_ML
 from simulation import reset_channel_stats
 from simulation import plot_success_by_cluster_size, plot_success_by_device_count, plot_success_cdf
-# ---------------------------------------------------- 
+import subprocess
+
+# ----------------------------------------------------
+# ML Enalbled or Disabled
+# ----------------------------------------------------
+
 if __name__ == "__main__":
 
     device_counts = [200, 500, 1000, 2000, 5000,10000, 20000]
@@ -32,7 +37,7 @@ if __name__ == "__main__":
             print(f"--- Running C = {C} ---")
 
             # Static clustering
-            clusters, cluster_channels = assign_clusters_distance_based(d, RX, C)
+            clusters, cluster_channels = assign_clusters_quantile_stratified(d, RX, C)
 
             reset_channel_stats()    # VERY IMPORTANT
 
@@ -49,4 +54,10 @@ if __name__ == "__main__":
     plot_success_by_device_count(results)
 
     # ---- OPTIONAL: CDF PLOT FOR LAST SIMULATION ----
-    plot_success_cdf()            
+    plot_success_cdf()    
+    # ---- TRAIN BEST PARAMETERS ----
+    if USE_ML:
+        subprocess.run(["python", "train_parameters.py"])
+        print("ML training complete. Updated best_params.json loaded next run.")
+
+        

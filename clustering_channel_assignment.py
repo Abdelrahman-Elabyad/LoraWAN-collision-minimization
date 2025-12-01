@@ -1,46 +1,73 @@
 import numpy as np
-from simulation import channel_stats
+import json
+from simulation import channel_stats, USE_ML
+
+
+
+# Default static parameters
+alpha = 1.0
+beta = 0.5
+gamma = 1.5
+lambda_val = 1.0
+
+# If ML enabled, load optimized parameters
+if USE_ML:
+    try:
+        with open("best_params.json", "r") as f:
+            params = json.load(f)
+        alpha = params["alpha"]
+        beta = params["beta"]
+        gamma = params["gamma"]
+        lambda_val = params["lambda"]
+    except:
+        print("[WARNING] best_params.json not found → using default parameters.")
+
 # ----------------------------------------------------
 # STATIC CLUSTER ASSIGNMENT BASED ON DISTANCE/RX
 # ----------------------------------------------------
-def assign_clusters_distance_based(d, RX, C, NUM_CHANNELS=8):
+def assign_clusters_quantile_stratified(d, RX, C, NUM_CHANNELS=8):
     """
-    Distance/RX-based static cluster assignment.
-    d: distances array of shape (N,)
-    RX: received power array of shape (N,)
-    C: number of channels per cluster (1, 2, or 4)
-    Returns:
-      clusters: array mapping each device to cluster index
-      cluster_channels: list of allowed channels per cluster
+    Power-quantile stratified static cluster assignment with dynamic bucket count.
+    Q is chosen based on N = number of devices.
+
+    Steps:
+    - Sort by RX (desc)
+    - Split into Q quantile buckets
+    - Round-robin assign buckets into clusters
     """
 
     N = len(d)
-    K = NUM_CHANNELS // C  # number of clusters
+    K = NUM_CHANNELS // C      # number of clusters
 
-    # 1. Sort devices by received power (strong → weak)
-    sorted_idx = np.argsort(-RX)   # negative to sort descending
+    # -------------------------------
+    # Dynamic quantile count Q(N)
+    # -------------------------------
+    Q = int(round(np.sqrt(N) / 5))
+    Q = max(4, min(Q, 30))     # keep Q between 4 and 30
 
-    # 2. Create cluster array
     clusters = np.zeros(N, dtype=int)
 
-    # 3. Balanced interleaving:
-    # Assign strongest, then weakest, then second strongest, then second weakest, etc.
-    i = 0                    # pointer for strongest
-    j = N - 1                # pointer for weakest
-    assign_order = []
+    # 1. Sort devices by RX descending
+    sorted_idx = np.argsort(-RX)
 
-    while i <= j:
-        assign_order.append(sorted_idx[i])
-        if i != j:
-            assign_order.append(sorted_idx[j])
-        i += 1
-        j -= 1
+    # 2. Build quantile buckets
+    buckets = []
+    bucket_size = int(np.ceil(N / Q))
 
-    # Now assign devices in round-robin across K clusters
-    for pos, dev_idx in enumerate(assign_order):
-        clusters[dev_idx] = pos % K
+    for q in range(Q):
+        start = q * bucket_size
+        end = min((q + 1) * bucket_size, N)
+        if start < end:
+            buckets.append(sorted_idx[start:end])
 
-    # 4. Build cluster channel lists
+    # 3. Round-robin assignment across clusters
+    cluster_id = 0
+    for bucket in buckets:
+        for dev_idx in bucket:
+            clusters[dev_idx] = cluster_id
+            cluster_id = (cluster_id + 1) % K
+
+    # 4. Build cluster → allowed channels mapping
     cluster_channels = []
     for k in range(K):
         start = k * C
@@ -54,40 +81,36 @@ def assign_clusters_distance_based(d, RX, C, NUM_CHANNELS=8):
 # ----------------------------------------------------
 
 def dynamic_select(allowed_channels, now):
-    """
-    Combined dynamic channel selection:
-    LRU + load-aware + collision-aware (weighted).
-    """
-
     scores = []
+    feature_list = []
+
+
     for ch in allowed_channels:
         stats = channel_stats[ch]
 
-        # LRU term
         lru_score = now - stats['last_used']
 
-        # Load term (penalize channels with many recent transmissions)
-        load_score = -(stats['transmissions'] / (sum(channel_stats[c]['transmissions'] for c in allowed_channels) + 1))
+        load_score = -(stats['transmissions'] /
+                        (sum(channel_stats[c]['transmissions'] for c in allowed_channels) + 1))
 
-        # Collision term (penalize channels with high collision ratio)
         if stats['transmissions'] == 0:
             collision_score = 0
         else:
             collision_score = -(stats['collisions'] / stats['transmissions'])
 
-        # Weighted sum
-        alpha = 1.0
-        beta = 0.5
-        gamma = 1.5
+        feature_list.append([lru_score, load_score, collision_score])
 
-        score = alpha * lru_score + beta * load_score + gamma * collision_score
+        score = alpha*lru_score + beta*load_score + gamma*collision_score
         scores.append(score)
 
-    # Softmax to convert scores → probabilities
-    lambda_val = 1.0
     exp_scores = np.exp(lambda_val * np.array(scores))
     probs = exp_scores / np.sum(exp_scores)
-    # similar to RL 
-    # Randomly choose channel according to probabilities
-    chosen = np.random.choice(allowed_channels, p=probs)
-    return chosen
+
+    chosen_idx = np.random.choice(len(allowed_channels), p=probs)
+    chosen_channel = allowed_channels[chosen_idx]
+
+    chosen_features = feature_list[chosen_idx]
+    chosen_score = scores[chosen_idx]
+    chosen_prob = probs[chosen_idx]
+
+    return chosen_channel, chosen_features, chosen_score, chosen_prob
