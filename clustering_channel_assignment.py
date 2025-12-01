@@ -3,12 +3,18 @@ import json
 from simulation import channel_stats, USE_ML
 
 
+# Recommended static parameters for maximum success (without ML)
+# Old default static parameters
+# alpha = 1.0
+# beta = 0.5
+# gamma = 1.5
+# lambda_val = 1.0
 
-# Default static parameters
-alpha = 1.0
-beta = 0.5
-gamma = 1.5
-lambda_val = 1.0
+# NEW Recommended parameters
+alpha = 1.5      # Prioritizes load balancing via LRU
+beta = 0.75      # Moderate penalty for overall channel load
+gamma = 2.0      # Heaviest penalty for direct failure evidence (collisions)
+lambda_val = 2.0 # Aggressive exploitation (greedy selection)
 
 # If ML enabled, load optimized parameters
 if USE_ML:
@@ -85,7 +91,7 @@ def dynamic_select(allowed_channels, now, observed_stats):
     feature_list = []
 
     for ch in allowed_channels:
-        stats = observed_stats[ch]   # <--- ONLY CHANGE HERE
+        stats = observed_stats[ch]   
 
         lru_score = now - stats['last_used']
 
@@ -101,9 +107,18 @@ def dynamic_select(allowed_channels, now, observed_stats):
 
         score = alpha*lru_score + beta*load_score + gamma*collision_score
         scores.append(score)
+    scores = np.array(scores)
 
-    exp_scores = np.exp(lambda_val * np.array(scores))
-    probs = exp_scores / np.sum(exp_scores)
+    # --- Numerically stable softmax ---
+    max_score = np.max(scores)                    # subtract the max for stability
+    exp_scores = np.exp(lambda_val * (scores - max_score))
+
+    sum_exp = np.sum(exp_scores)
+    if sum_exp == 0:                              # fallback (rare safeguard)
+        probs = np.ones_like(exp_scores) / len(exp_scores)
+    else:
+        probs = exp_scores / sum_exp
+    # --- End softmax fix ---
 
     chosen_idx = np.random.choice(len(allowed_channels), p=probs)
     chosen_channel = allowed_channels[chosen_idx]
