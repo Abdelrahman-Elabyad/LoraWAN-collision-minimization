@@ -1,20 +1,34 @@
+import copy
 import numpy as np
 import math
 import matplotlib.pyplot as plt
 import os
 import csv
+
 # ----------------------------------------------------
 RADIUS = 1.0                    # km
 NUM_CHANNELS = 8
 PACKET_DURATION = 0.050         # 50 ms
 MEAN_INTERARRIVAL = 600         # seconds per device
-TOTAL_PACKETS = 300000
-
-
+TOTAL_PACKETS = 10000
 success_distances = []
 failure_distances = []
 DATASET_FILE = "channel_training_data.csv"
+
 USE_ML = False   # or True
+
+# -------- Information model configuration --------
+INFO_MODE = "PER_DEVICE_DELAY"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY"
+GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
+DEVICE_UPDATE_DELAY = 2.0       # seconds after each device's last uplink
+# -------------------------------------------------
+
+# These are module-level STATE VARIABLES
+stale_stats = None
+last_global_update = 0.0
+device_stats = None
+last_device_update = None
+
 
 # Global statistics for dynamic channel selection
 channel_stats = {
@@ -172,14 +186,20 @@ def check_collision(channel_packets, timestamp, end_time, RX):
 
 def run_simulation(N, clusters, cluster_channels, select_channel_fn):
     global success_distances, failure_distances
+    global stale_stats, last_global_update, device_stats, last_device_update
     success_distances = []
     failure_distances = []
-    """
-    N: number of devices
-    clusters: array mapping device → cluster index
-    cluster_channels: list of channels for each cluster
-    select_channel_fn: function(allowed_channels, now) → channel_id
-    """
+
+    # IMPORTANT: Reset global stats or stale_stats will use OLD values
+    reset_channel_stats()
+
+    # --- Initialize info models for this run ---
+    stale_stats = copy.deepcopy(channel_stats)      # start with current stats (all zeros at first)
+    last_global_update = 0.0
+
+    device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
+    last_device_update = [0.0 for _ in range(N)]
+
 
     # Prepare device parameters
     distances, RX = generate_devices(N)
@@ -199,8 +219,28 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
         cluster_id = clusters[dev]
         allowed = cluster_channels[cluster_id]
 
-        # 2. Choose channel dynamically
-        channel, feat, score, prob = select_channel_fn(allowed, t)
+       # 2. Update WHAT THE DEVICE KNOWS ----
+        if INFO_MODE == "GLOBAL_DELAY":
+            # update global stale view every GLOBAL_UPDATE_INTERVAL
+            if t - last_global_update >= GLOBAL_UPDATE_INTERVAL:
+                stale_stats = copy.deepcopy(channel_stats)
+                last_global_update = t
+
+            observed_stats = stale_stats
+
+        elif INFO_MODE == "PER_DEVICE_DELAY":
+            # update device-specific stale stats AFTER its last transmission delay
+            if t - last_device_update[dev] >= DEVICE_UPDATE_DELAY:
+                device_stats[dev] = copy.deepcopy(channel_stats)
+                last_device_update[dev] = t
+
+            observed_stats = device_stats[dev]
+
+        else:
+            raise ValueError("Invalid INFO_MODE")
+
+        # ---- Select channel using stale observed stats ----
+        channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats)
 
         # 3. Remove expired (finished) packets from this channel
         ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
@@ -215,8 +255,7 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
         # 6. Check collision/capture
         ok = check_collision(ongoing[channel], t, end_t, RX[dev])
         
-        
-
+        # 7. Log result
         if USE_ML:
             append_training_data(
                 time=t,

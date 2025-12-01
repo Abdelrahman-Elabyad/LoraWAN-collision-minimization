@@ -80,18 +80,17 @@ def assign_clusters_quantile_stratified(d, RX, C, NUM_CHANNELS=8):
 # DYNAMIC CHANNEL SELECTION Algorithim
 # ----------------------------------------------------
 
-def dynamic_select(allowed_channels, now):
+def dynamic_select(allowed_channels, now, observed_stats):
     scores = []
     feature_list = []
 
-
     for ch in allowed_channels:
-        stats = channel_stats[ch]
+        stats = observed_stats[ch]   # <--- ONLY CHANGE HERE
 
         lru_score = now - stats['last_used']
 
         load_score = -(stats['transmissions'] /
-                        (sum(channel_stats[c]['transmissions'] for c in allowed_channels) + 1))
+                        (sum(observed_stats[c]['transmissions'] for c in allowed_channels) + 1))
 
         if stats['transmissions'] == 0:
             collision_score = 0
@@ -114,3 +113,4 @@ def dynamic_select(allowed_channels, now):
     chosen_prob = probs[chosen_idx]
 
     return chosen_channel, chosen_features, chosen_score, chosen_prob
+

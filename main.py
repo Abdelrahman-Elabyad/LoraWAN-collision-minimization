@@ -18,8 +18,9 @@ if __name__ == "__main__":
     cluster_sizes = [1, 2, 4]
 
     # Dynamic channel selection
-    def select_channel(allowed, now):
-        return dynamic_select(allowed, now)
+    def select_channel(allowed, now, observed_stats):
+        return dynamic_select(allowed, now, observed_stats)
+
 
     # Dictionary to store results: results[N][C] = success probability
     results = {}
