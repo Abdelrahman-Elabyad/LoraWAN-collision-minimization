@@ -21,7 +21,7 @@ USE_ML = False   # or True
 # -------- Information model configuration --------
 INFO_MODE = "HYBRID"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY" or "HYBRID"
 GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
-DEVICE_UPDATE_DELAY = 1       # seconds after each device's last uplink
+DEVICE_UPDATE_DELAY = 1    # seconds after each device's last uplink
 # -------------------------------------------------
 
 # These are module-level STATE VARIABLES
