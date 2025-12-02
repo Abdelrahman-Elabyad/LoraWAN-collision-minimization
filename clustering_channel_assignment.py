@@ -16,6 +16,7 @@ beta = 0.75      # Moderate penalty for overall channel load
 gamma = 2.0      # Heaviest penalty for direct failure evidence (collisions)
 lambda_val = 2.0 # Aggressive exploitation (greedy selection)
 
+
 # If ML enabled, load optimized parameters
 if USE_ML:
     try:

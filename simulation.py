@@ -18,9 +18,9 @@ DATASET_FILE = "channel_training_data.csv"
 USE_ML = False   # or True
 
 # -------- Information model configuration --------
-INFO_MODE = "PER_DEVICE_DELAY"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY"
+INFO_MODE = "HYBRID"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY" or "HYBRID"
 GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
-DEVICE_UPDATE_DELAY = 2.0       # seconds after each device's last uplink
+DEVICE_UPDATE_DELAY = 1.5       # seconds after each device's last uplink
 # -------------------------------------------------
 
 # These are module-level STATE VARIABLES
@@ -235,6 +235,25 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
                 last_device_update[dev] = t
 
             observed_stats = device_stats[dev]
+
+        elif INFO_MODE == "HYBRID":
+            # ---- GLOBAL periodic update ----
+            if t - last_global_update >= GLOBAL_UPDATE_INTERVAL:
+                stale_stats = copy.deepcopy(channel_stats)
+                last_global_update = t
+
+            # ---- PER-DEVICE local update ----
+            if t - last_device_update[dev] >= DEVICE_UPDATE_DELAY:
+                device_stats[dev] = copy.deepcopy(channel_stats)
+                last_device_update[dev] = t
+
+            # ---- Combine sources: prefer the fresher of the two ----
+            # device_stats[dev] timestamp = last_device_update[dev]
+            # stale_stats timestamp = last_global_update
+            if last_device_update[dev] >= last_global_update:
+                observed_stats = device_stats[dev]        # fresher local update
+            else:
+                observed_stats = stale_stats              # fresher global update
 
         else:
             raise ValueError("Invalid INFO_MODE")
