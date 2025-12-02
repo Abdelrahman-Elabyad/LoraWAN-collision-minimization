@@ -4,6 +4,7 @@ import math
 import matplotlib.pyplot as plt
 import os
 import csv
+import heapq
 
 # ----------------------------------------------------
 RADIUS = 1.0                    # km
@@ -20,7 +21,7 @@ USE_ML = False   # or True
 # -------- Information model configuration --------
 INFO_MODE = "HYBRID"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY" or "HYBRID"
 GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
-DEVICE_UPDATE_DELAY = 1.5       # seconds after each device's last uplink
+DEVICE_UPDATE_DELAY = 1       # seconds after each device's last uplink
 # -------------------------------------------------
 
 # These are module-level STATE VARIABLES
@@ -185,119 +186,130 @@ def check_collision(channel_packets, timestamp, end_time, RX):
 # ----------------------------------------------------
 
 def run_simulation(N, clusters, cluster_channels, select_channel_fn):
+    import heapq
     global success_distances, failure_distances
     global stale_stats, last_global_update, device_stats, last_device_update
+
     success_distances = []
     failure_distances = []
 
-    # IMPORTANT: Reset global stats or stale_stats will use OLD values
+    # Reset stats
     reset_channel_stats()
 
-    # --- Initialize info models for this run ---
-    stale_stats = copy.deepcopy(channel_stats)      # start with current stats (all zeros at first)
+    # Initialize stale views
+    stale_stats = copy.deepcopy(channel_stats)
     last_global_update = 0.0
 
     device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
     last_device_update = [0.0 for _ in range(N)]
 
-
-    # Prepare device parameters
+    # Device positions + arrivals
     distances, RX = generate_devices(N)
     arrivals = generate_arrivals(N)
 
-    # Track ongoing packets per channel
+    # Ongoing packets per channel
     ongoing = [[] for _ in range(NUM_CHANNELS)]
+
+    # ---------- EVENT QUEUE ----------
+    event_queue = []
+
+    # Insert all arrival events NOW
+    for t in arrivals:
+        dev = np.random.randint(0, N)    # SAME as before
+        heapq.heappush(event_queue, (t, "arrival", dev))
+
+    # Insert periodic global updates
+    if INFO_MODE in ["GLOBAL_DELAY", "HYBRID"]:
+        next_global = GLOBAL_UPDATE_INTERVAL
+        sim_end = arrivals[-1] + 10.0
+        while next_global < sim_end:
+            heapq.heappush(event_queue, (next_global, "global_update", None))
+            next_global += GLOBAL_UPDATE_INTERVAL
 
     success = 0
 
-    for t in arrivals:
+    # -------------- MAIN LOOP --------------
+    while event_queue:
+        t, event_type, dev = heapq.heappop(event_queue)
 
-        # 1. Pick a random device
-        dev = np.random.randint(0, N)
-        d_dev = distances[dev]
+        # -------- DEVICE UPDATE EVENT --------
+        if event_type == "dev_update":
+            device_stats[dev] = copy.deepcopy(channel_stats)
+            last_device_update[dev] = t
+            continue
 
-        cluster_id = clusters[dev]
-        allowed = cluster_channels[cluster_id]
+        # -------- GLOBAL UPDATE EVENT --------
+        if event_type == "global_update":
+            stale_stats = copy.deepcopy(channel_stats)
+            last_global_update = t
+            continue
 
-       # 2. Update WHAT THE DEVICE KNOWS ----
-        if INFO_MODE == "GLOBAL_DELAY":
-            # update global stale view every GLOBAL_UPDATE_INTERVAL
-            if t - last_global_update >= GLOBAL_UPDATE_INTERVAL:
-                stale_stats = copy.deepcopy(channel_stats)
-                last_global_update = t
+        # -------- PACKET ARRIVAL EVENT --------
+        if event_type == "arrival":
 
-            observed_stats = stale_stats
+            d_dev = distances[dev]
+            cluster_id = clusters[dev]
+            allowed = cluster_channels[cluster_id]
 
-        elif INFO_MODE == "PER_DEVICE_DELAY":
-            # update device-specific stale stats AFTER its last transmission delay
-            if t - last_device_update[dev] >= DEVICE_UPDATE_DELAY:
-                device_stats[dev] = copy.deepcopy(channel_stats)
-                last_device_update[dev] = t
+            # -------- SELECT OBSERVED STATS (IDENTICAL TO OLD BEHAVIOR) --------
+            if INFO_MODE == "GLOBAL_DELAY":
+                observed_stats = stale_stats
 
-            observed_stats = device_stats[dev]
+            elif INFO_MODE == "PER_DEVICE_DELAY":
+                observed_stats = device_stats[dev]
 
-        elif INFO_MODE == "HYBRID":
-            # ---- GLOBAL periodic update ----
-            if t - last_global_update >= GLOBAL_UPDATE_INTERVAL:
-                stale_stats = copy.deepcopy(channel_stats)
-                last_global_update = t
+            elif INFO_MODE == "HYBRID":
+                if last_device_update[dev] >= last_global_update:
+                    observed_stats = device_stats[dev]
+                else:
+                    observed_stats = stale_stats
 
-            # ---- PER-DEVICE local update ----
-            if t - last_device_update[dev] >= DEVICE_UPDATE_DELAY:
-                device_stats[dev] = copy.deepcopy(channel_stats)
-                last_device_update[dev] = t
-
-            # ---- Combine sources: prefer the fresher of the two ----
-            # device_stats[dev] timestamp = last_device_update[dev]
-            # stale_stats timestamp = last_global_update
-            if last_device_update[dev] >= last_global_update:
-                observed_stats = device_stats[dev]        # fresher local update
             else:
-                observed_stats = stale_stats              # fresher global update
+                raise ValueError("Invalid INFO_MODE")
 
-        else:
-            raise ValueError("Invalid INFO_MODE")
+            # -------- CHANNEL SELECTION (UNCHANGED) --------
+            channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats)
 
-        # ---- Select channel using stale observed stats ----
-        channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats)
+            # Remove expired transmissions
+            ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
 
-        # 3. Remove expired (finished) packets from this channel
-        ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
+            end_t = t + PACKET_DURATION
 
-        # 4. Compute end time
-        end_t = t + PACKET_DURATION
+            # Update stats
+            channel_stats[channel]['transmissions'] += 1
+            channel_stats[channel]['last_used'] = t
 
-        # 5. Update stats: transmission attempted
-        channel_stats[channel]['transmissions'] += 1
-        channel_stats[channel]['last_used'] = t
+            # Collision
+            ok = check_collision(ongoing[channel], t, end_t, RX[dev])
 
-        # 6. Check collision/capture
-        ok = check_collision(ongoing[channel], t, end_t, RX[dev])
-        
-        # 7. Log result
-        if USE_ML:
-            append_training_data(
-                time=t,
-                channel=channel,
-                lru_score=feat[0],
-                load_score=feat[1],
-                collision_score=feat[2],
-                score=score,
-                probability=prob,
-                success=int(ok),
-                distance=d_dev,
-                rx=RX[dev]
-            )
+            # Logging
+            if USE_ML:
+                append_training_data(
+                    time=t,
+                    channel=channel,
+                    lru_score=feat[0],
+                    load_score=feat[1],
+                    collision_score=feat[2],
+                    score=score,
+                    probability=prob,
+                    success=int(ok),
+                    distance=d_dev,
+                    rx=RX[dev]
+                )
 
-        if ok:
-            success += 1
-            channel_stats[channel]['successes'] += 1
-            success_distances.append(d_dev)
-        else:
-            channel_stats[channel]['collisions'] += 1
-            failure_distances.append(d_dev)
+            if ok:
+                success += 1
+                channel_stats[channel]['successes'] += 1
+                success_distances.append(d_dev)
+            else:
+                channel_stats[channel]['collisions'] += 1
+                failure_distances.append(d_dev)
 
-    # SUCCESS PROBABILITY
+            # ---------- SCHEDULE DEVICE UPDATE ----------
+            update_time = t + DEVICE_UPDATE_DELAY
+            heapq.heappush(event_queue, (update_time, "dev_update", dev))
+
+    # Return success probability
     return success / TOTAL_PACKETS
 
 # ----------------------------------------------------
