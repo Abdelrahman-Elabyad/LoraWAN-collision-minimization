@@ -2,6 +2,12 @@ import numpy as np
 import json
 import simulation 
 
+#for the scoring based selection
+alpha = 1.5
+beta = 0.75
+gamma = 2.0
+lambda_val = 2.0
+
 # ----------------------------------------------------
 # STATIC CLUSTER ASSIGNMENT BASED ON DISTANCE/RX
 # ----------------------------------------------------
@@ -57,13 +63,31 @@ def assign_clusters_quantile_stratified(d, RX, C, NUM_CHANNELS=8):
     return clusters, cluster_channels
 
 # ----------------------------------------------------
+# STATIC RANDOM CLUSTER ASSIGNMENT  
+# ----------------------------------------------------
+def assign_clusters_random(N, C, NUM_CHANNELS=8):
+    """
+    Randomly assign each device to a cluster,
+    and map clusters to channels sequentially.
+    """
+    K = NUM_CHANNELS // C  # number of clusters
+
+    # Random cluster per device
+    clusters = np.random.randint(0, K, size=N)
+
+    # Cluster → allowed channel mapping
+    cluster_channels = []
+    for k in range(K):
+        start = k * C
+        ch_list = list(range(start, start + C))
+        cluster_channels.append(ch_list)
+
+    return clusters, cluster_channels
+
+# ----------------------------------------------------
 # THOMPSON SAMPLING DYNAMIC CHANNEL SELECTION
 # ----------------------------------------------------
-
-
-LAMBDA_LRU = 0.25
-LAMBDA_OVER = 0.4
-def dynamic_select(allowed_channels, now, observed_stats):
+def thompson_select(allowed_channels, now, observed_stats,N):
     """
     Improved Thompson Sampling with probabilistic selection.
     """
@@ -160,8 +184,10 @@ def dynamic_select(allowed_channels, now, observed_stats):
     ]
 
     return chosen_channel, features, combined_scores[chosen_idx], probabilities[chosen_idx]
-
-def dynamic_select(allowed_channels, now, observed_stats, epsilon=None):
+# ----------------------------------------------------
+# ADAPTIVE EPSILON-GREEDY WRAPPER FOR THOMPSON SAMPLING(Actual funciton called in main) 
+# ----------------------------------------------------
+def thompson_select_wrapper(allowed_channels, now, observed_stats, N):
     """
     Adaptive epsilon-greedy with load-based exploration.
     At high loads (many transmissions), increase exploration to combat stale data.
@@ -193,11 +219,154 @@ def dynamic_select(allowed_channels, now, observed_stats, epsilon=None):
         return chosen_channel, [0, 0, 0, 0], 0.5, 1.0 / len(candidate_channels)
     
     # EXPLOIT: Use Thompson Sampling
-    return dynamic_select(allowed_channels, now, observed_stats)
+    return thompson_select(allowed_channels, now, observed_stats)
 
+# ----------------------------------------------------
+# SCORING-BASED SOFTMAX DYNAMIC CHANNEL SELECTION
+# ----------------------------------------------------
+def scoring_select(allowed_channels, now, observed_stats,N):
+    """
+    Classical scoring-based softmax dynamic selection.
+    Uses:
+        - LRU score
+        - Load score
+        - Collision score
+    Weighted by alpha, beta, gamma and passed through softmax.
+    """
 
+    scores = []
+    feature_list = []
 
-def random_select(allowed_channels, now, observed_stats):
+    # Precompute total transmissions inside this cluster
+    total_trans = sum(observed_stats[ch]['transmissions'] for ch in allowed_channels) + 1
+
+    for ch in allowed_channels:
+        st = observed_stats[ch]
+
+        # --- LRU SCORE ---
+        lru_score = now - st['last_used'] if st['last_used'] > 0 else now
+
+        # --- LOAD SCORE (negative means penalize hotspots) ---
+        load_score = -(st['transmissions'] / total_trans)
+
+        # --- COLLISION SCORE ---
+        if st['transmissions'] == 0:
+            collision_score = 0.0
+        else:
+            collision_score = -(st['collisions'] / st['transmissions'])
+
+        feature_list.append([lru_score, load_score, collision_score])
+
+        # Weighted sum
+        score = alpha * lru_score + beta * load_score + gamma * collision_score
+        scores.append(score)
+
+    scores = np.array(scores)
+
+    # -------- SOFTMAX (numerically stable) --------
+    max_score = np.max(scores)
+    exp_scores = np.exp(lambda_val * (scores - max_score))
+
+    sum_exp = np.sum(exp_scores)
+    if sum_exp == 0:
+        probs = np.ones_like(exp_scores) / len(exp_scores)
+    else:
+        probs = exp_scores / sum_exp
+
+    # -------- SAMPLE CHANNEL --------
+    chosen_idx = np.random.choice(len(allowed_channels), p=probs)
+    chosen_channel = allowed_channels[chosen_idx]
+
+    return chosen_channel, feature_list[chosen_idx], scores[chosen_idx], probs[chosen_idx]
+
+# ----------------------------------------------------
+# SMART LONG-TERM DYNAMIC CHANNEL SELECTION (Instead of using old stale parameters, we use long-term stats)
+# ----------------------------------------------------
+def smart_dynamic_select(allowed_channels, now, observed_stats,N):
+    """
+    Smart long-term dynamic selection using:
+      - TS long-term success estimate (p_ts)
+      - EMA of collisions (ema_coll)
+      - Trend of success (trend)
+    Then uses softmax over a combined score to make *smart random* decisions.
+    """
+
+    candidate_channels = list(allowed_channels)
+    n = len(candidate_channels)
+
+    if n == 1:
+        ch = candidate_channels[0]
+        return ch, [0, 0, 0, 0], 0.5, 1.0
+
+    scores = []
+    features = []
+
+    # Weights for combining signals
+    W_SUCC  = 1.2   # weight for success prob
+    W_COLL  = 0.1   # penalty for collisions
+    W_TREND = 0.0   # reward for positive trend
+
+    for ch in candidate_channels:
+        st = observed_stats[ch]
+
+        # 1) TS-based success estimate (from stale alpha/beta)
+        alpha = st.get("ts_alpha", 1.0)
+        beta  = st.get("ts_beta", 1.0)
+        p_ts = alpha / (alpha + beta)
+
+        # 2) EMA of collision indicator (0..1)
+        ema_coll = st.get("ema_coll", 0.0)
+
+        # 3) Trend of success (can be negative/positive)
+        trend = st.get("trend", 0.0)
+
+        # Combined long-term score:
+        #   high p_ts is good
+        #   high ema_coll is bad
+        #   positive trend is good
+        S = W_SUCC * p_ts - W_COLL * ema_coll + W_TREND * trend
+
+        scores.append(S)
+        features.append([p_ts, ema_coll, trend, S])
+
+    scores = np.array(scores)
+
+    # Normalize scores for numerical stability
+    max_score = np.max(scores)
+    scores_centered = scores - max_score
+
+    # N_MAX is the normalization point where temperature reaches 0.7
+    N_MAX = 100000 
+    
+    # Load Factor (scales from 0 at low N to 1 at N_MAX)
+    load_factor = min(N / N_MAX, 1.0)
+    
+    # Dynamic Temperature: Base 0.2 + up to 0.5 bonus (to reach 0.7 max)
+    BASE_TEMP = 0.2
+    MAX_BONUS = 0.5
+    temperature = BASE_TEMP + load_factor * MAX_BONUS
+    exp_scores = np.exp(scores_centered / temperature)
+    sum_exp = np.sum(exp_scores)
+
+    if sum_exp <= 0:
+        probs = np.ones_like(exp_scores) / len(exp_scores)
+    else:
+        probs = exp_scores / sum_exp
+
+    # Sample channel according to learned probabilities
+    idx = np.random.choice(len(candidate_channels), p=probs)
+    chosen_channel = candidate_channels[idx]
+
+    chosen_features = features[idx]
+    chosen_score = scores[idx]
+    chosen_prob = probs[idx]
+
+    return chosen_channel, chosen_features, chosen_score, chosen_prob
+
+# ----------------------------------------------------
+# BASELINE RANDOM CHANNEL SELECTION
+# ----------------------------------------------------
+def random_select(allowed_channels, now, observed_stats,N):
     """
     Baseline: choose a channel uniformly at random
     from the allowed set. Ignores all stats.

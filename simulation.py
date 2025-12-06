@@ -2,8 +2,6 @@ import copy
 import numpy as np
 import math
 import matplotlib.pyplot as plt
-import os
-import csv
 import heapq
 
 # ----------------------------------------------------
@@ -16,7 +14,7 @@ success_distances = []
 failure_distances = []
 # -------- Information model configuration --------
 INFO_MODE = "HYBRID"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY" or "HYBRID"
-GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
+GLOBAL_UPDATE_INTERVAL = 2.0   # seconds
 DEVICE_UPDATE_DELAY = 1    # seconds after each device's last uplink
 # -------------------------------------------------
 
@@ -29,29 +27,42 @@ last_device_update = None
 # Global statistics for dynamic channel selection
 channel_stats = {
     ch: {
-        'last_used': 0.0,
-        'transmissions': 0,
-        'collisions': 0,
-        'successes': 0,
-        'ts_alpha': 1.0,  # ← ADD THIS
-        'ts_beta': 1.0    # ← ADD THIS
+        "last_used": 0.0,
+        "transmissions": 0,
+        "collisions": 0,
+        "successes": 0,
+
+        # Thompson Sampling counters
+        "ts_alpha": 1.0,
+        "ts_beta": 1.0,
+
+        # NEW: long-term learning fields
+        "ema_succ": 0.5,   # exponential moving average of success
+        "ema_coll": 0.0,   # exponential moving average of collision indicator
+        "trend": 0.0,      # trend of success probability
+        "last_p_ts": 0.5,  # last TS success estimate
     }
     for ch in range(NUM_CHANNELS)
 }
 
 
+
 def reset_channel_stats():
-    """Reset all channel statistics including TS counters."""
     global channel_stats
     for ch in range(NUM_CHANNELS):
         channel_stats[ch] = {
-            'last_used': 0.0,
-            'transmissions': 0,
-            'collisions': 0,
-            'successes': 0,
-            'ts_alpha': 1.0,  # Reset TS
-            'ts_beta': 1.0
+            "last_used": 0.0,
+            "transmissions": 0,
+            "collisions": 0,
+            "successes": 0,
+            "ts_alpha": 1.0,
+            "ts_beta": 1.0,
+            "ema_succ": 0.5,
+            "ema_coll": 0.0,
+            "trend": 0.0,
+            "last_p_ts": 0.5,
         }
+
 
 # ----------------------------------------------------
 # DEVICE GENERATION
@@ -145,8 +156,8 @@ def check_collision(channel_packets, timestamp, end_time, RX):
 # MAIN SIMULATION
 # ----------------------------------------------------
 
-def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn):
-    import heapq
+def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn,arrivals,dev_sequence):
+
     global stale_stats, last_global_update, device_stats, last_device_update
     success_distances = []  
     failure_distances = [] 
@@ -160,13 +171,11 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
     device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
     last_device_update = [0.0 for _ in range(N)]
 
-    arrivals = generate_arrivals(N)
     ongoing = [[] for _ in range(NUM_CHANNELS)]
     event_queue = []
 
     # Insert packet arrivals
-    for t in arrivals:
-        dev = np.random.randint(0, N)
+    for t, dev in zip(arrivals, dev_sequence):
         heapq.heappush(event_queue, (t, "arrival", dev))
 
     # Insert periodic global updates (Class B downlinks)
@@ -218,115 +227,78 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
                 raise ValueError("Invalid INFO_MODE")
 
             # -------- CHANNEL SELECTION (uses STALE data) --------
-            channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats)
-
-            # Add this for debugging (only prints first 5 packets):
-            if success + (TOTAL_PACKETS - success) <= 5:  # First 5 packets
-                debug_info_model_snapshot(t, dev, channel, observed_stats, channel_stats)
+            channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats,N)
 
             # Remove expired transmissions
             ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
 
             end_t = t + PACKET_DURATION
 
-            # -------- UPDATE GROUND TRUTH STATS (immediate) --------
+           # -------- UPDATE GROUND TRUTH STATS (immediate) --------
             channel_stats[channel]['transmissions'] += 1
             channel_stats[channel]['last_used'] = t
 
             # Check collision
             ok = check_collision(ongoing[channel], t, end_t, RX[dev])
 
-            # -------- UPDATE TS COUNTERS (immediate, in ground truth) --------
-            if len(feat) >= 4:
-                score_val = feat[3]
-                pseudo_success = max(score_val, 0)
-                pseudo_fail = max(-score_val, 0)
-                
-                # Update GROUND TRUTH TS counters
-                # These will be propagated to devices via delayed updates
-                channel_stats[channel]['ts_alpha'] += pseudo_success
-                channel_stats[channel]['ts_beta'] += pseudo_fail
+            # ----- INSTANTANEOUS OUTCOME -----
+            inst_succ = 1.0 if ok else 0.0
+            inst_coll = 0.0 if ok else 1.0
 
-            # Track success/failure
+            # ----- UPDATE COUNTERS -----
             if ok:
                 success += 1
                 channel_stats[channel]['successes'] += 1
+                channel_stats[channel]['ts_alpha'] += 1
                 success_distances.append(d_dev)
             else:
                 channel_stats[channel]['collisions'] += 1
+                channel_stats[channel]['ts_beta'] += 1
                 failure_distances.append(d_dev)
-            # -------- SCHEDULE DEVICE UPDATE (ACK downlink) --------
+
+            # ----- UPDATE LONG-TERM EMA METRICS -----
+            BETA_SUCC  = 0.02
+            BETA_COLL  = 0.02
+            BETA_TREND = 0.05
+
+            # EMA success
+            channel_stats[channel]['ema_succ'] = \
+                (1.0 - BETA_SUCC) * channel_stats[channel]['ema_succ'] + \
+                BETA_SUCC * inst_succ
+
+            # EMA collision
+            channel_stats[channel]['ema_coll'] = \
+                (1.0 - BETA_COLL) * channel_stats[channel]['ema_coll'] + \
+                BETA_COLL * inst_coll
+
+            # Trend of TS success probability
+            p_ts_old = channel_stats[channel]['last_p_ts']
+            p_ts_new = channel_stats[channel]['ts_alpha'] / \
+                    (channel_stats[channel]['ts_alpha'] + channel_stats[channel]['ts_beta'])
+
+            delta_p = p_ts_new - p_ts_old
+            channel_stats[channel]['trend'] = \
+                (1.0 - BETA_TREND) * channel_stats[channel]['trend'] + \
+                BETA_TREND * delta_p
+
+            channel_stats[channel]['last_p_ts'] = p_ts_new
+
+            # ----- TS DECAY -----
+            if channel_stats[channel]['transmissions'] % 2000 == 0:
+                for ch2 in range(NUM_CHANNELS):
+                    channel_stats[ch2]['ts_alpha'] = max(1.0, channel_stats[ch2]['ts_alpha'] * 0.95)
+                    channel_stats[ch2]['ts_beta']  = max(1.0, channel_stats[ch2]['ts_beta']  * 0.95)
+
+            # -------- SCHEDULE DEVICE UPDATE (ACK downlink) -------
             update_time = t + DEVICE_UPDATE_DELAY
             heapq.heappush(event_queue, (update_time, "dev_update", dev))
+
 
     return success / TOTAL_PACKETS
 
 # ----------------------------------------------------
-# DEBUGGING FUNCTION TO VERIFY INFORMATION MODEL
+# PLOTTING FUNCTIONS
 # ----------------------------------------------------
-
-def debug_info_model_snapshot(t, dev, channel, observed_stats, real_stats, ts_alpha, ts_beta):
-    """
-    Call this during simulation to verify stale vs real data.
-    Add this right after channel selection in your main loop.
-    """
-    print(f"\n{'='*60}")
-    print(f"Time: {t:.2f}s | Device: {dev} | Selected Channel: {channel}")
-    print(f"{'='*60}")
-    
-    print(f"\n📊 OBSERVED STATS (what device sees - DELAYED):")
-    obs = observed_stats[channel]
-    print(f"  Transmissions: {obs['transmissions']}")
-    print(f"  Successes: {obs['successes']}")
-    print(f"  Collisions: {obs['collisions']}")
-    print(f"  Last used: {obs['last_used']:.2f}s")
-    
-    print(f"\n🎯 REAL STATS (ground truth - CURRENT):")
-    real = real_stats[channel]
-    print(f"  Transmissions: {real['transmissions']}")
-    print(f"  Successes: {real['successes']}")
-    print(f"  Collisions: {real['collisions']}")
-    print(f"  Last used: {real['last_used']:.2f}s")
-    
-    print(f"\n🎲 THOMPSON SAMPLING COUNTERS (GLOBAL - IMMEDIATE):")
-    print(f"  Alpha (successes): {ts_alpha[channel]:.2f}")
-    print(f"  Beta (failures): {ts_beta[channel]:.2f}")
-    
-    print(f"\n⚠️  CONSISTENCY CHECK:")
-    if obs['transmissions'] == real['transmissions']:
-        print("  ✓ Observed = Real (NO DELAY)")
-    else:
-        delay = real['transmissions'] - obs['transmissions']
-        print(f"  ✓ Observed < Real by {delay} transmissions (DELAYED as expected)")
-    
-    print(f"{'='*60}")
-
-# ----------------------------------------------------
-# EXPERIMENTS & PLOTTING FUNCTIONS
-# ----------------------------------------------------
-
-def experiment_vary_C(N, clustering_fn, selection_fn):
-    results = {}
-
-    for C in [1, 2, 4]:
-        print(f"Running experiment with C = {C}")
-
-        # Generate devices for this experiment
-        d, RX = generate_devices(N)
-
-        # Static clustering algorithm
-        clusters, cluster_channels = clustering_fn(d, RX, C)
-
-        # Reset stats
-        reset_channel_stats()
-
-        # Run simulation
-        prob = run_simulation(N, clusters, cluster_channels, selection_fn)
-        results[C] = prob
-
-        print(f"C = {C}, success = {prob}")
-
-    return results
 
 def plot_success_vs_C(results, title="Success vs Cluster Size"):
     Cs = sorted(results.keys())
