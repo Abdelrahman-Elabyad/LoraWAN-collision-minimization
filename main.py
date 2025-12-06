@@ -1,74 +1,51 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import os
-import csv
 import math
 from clustering_channel_assignment import assign_clusters_quantile_stratified, dynamic_select, random_select
-from simulation import run_simulation, generate_devices, generate_arrivals, check_collision, PACKET_DURATION, TOTAL_PACKETS, NUM_CHANNELS, channel_stats, DATASET_FILE, USE_ML
-from simulation import reset_channel_stats
+from simulation import run_simulation, generate_devices, reset_channel_stats
 from simulation import plot_success_by_cluster_size, plot_success_by_device_count, plot_success_cdf
-import subprocess
+from simulation import PACKET_DURATION, MEAN_INTERARRIVAL, NUM_CHANNELS
 
-# ----------------------------------------------------
-# ML Enalbled or Disabled
-# ----------------------------------------------------
+def pure_aloha_theory(N):
+    """
+    Calculate Pure ALOHA success probability.
+    G = (arrival_rate_per_channel) × (packet_duration)
+    G = (N/MEAN_INTERARRIVAL/NUM_CHANNELS) × PACKET_DURATION
+    """
+    arrival_rate = N / MEAN_INTERARRIVAL  # total packets/second
+    rate_per_channel = arrival_rate / NUM_CHANNELS
+    G = rate_per_channel * PACKET_DURATION
+    return math.exp(-2 * G)
 
 if __name__ == "__main__":
 
-    device_counts = [200, 500, 1000, 2000, 5000,10000, 20000, 50000, 100000]
+    device_counts = [200, 500, 1000, 2000, 5000, 10000, 20000]
     cluster_sizes = [1, 2, 4, 8]
-
-    # Dynamic channel selection
-    def select_channel(allowed, now, observed_stats):
-        return dynamic_select(allowed, now, observed_stats)
-
-    # Dictionary to store results: results[N][C] = success probability
     results = {}
 
-    # ---- RUN ALL EXPERIMENTS ----
     for N in device_counts:
         results[N] = {}
-
-        print(f"\n========== Testing N = {N} devices ==========")
-
-        # Generate devices ONCE for each N
+        print(f"\n========== N = {N} ==========")
+        
         d, RX = generate_devices(N)
+        theory = pure_aloha_theory(N)
 
         for C in cluster_sizes:
-            print(f"--- Running C = {C} ---")
-
-            # Static clustering
             clusters, cluster_channels = assign_clusters_quantile_stratified(d, RX, C)
 
-            # ==============================
-            # 1) Dynamic (TS) Selection
-            # ==============================
             reset_channel_stats()
-            prob_ts = run_simulation(N, d, RX, clusters, cluster_channels, select_channel)
+            prob_random = run_simulation(N, d, RX, clusters, cluster_channels, random_select)
 
-            results[N][C] = prob_ts   # keep TS version for plots
-
-            # ==============================
-            # 2) Random Channel Selection
-            # ==============================
             reset_channel_stats()
-            prob_rand = run_simulation(N,d, RX, clusters, cluster_channels, random_select)
-            print(
-                f"[RANDOM] N={N}, C={C} => "
-                f"Success = {prob_rand:.4f},  "
-            )
-        
-    # ---- PLOT 1: SUCCESS VS CLUSTER SIZE (for each N) ----
+            prob_dynamic = run_simulation(N, d, RX, clusters, cluster_channels, dynamic_select)
+
+            results[N][C] = prob_dynamic
+
+            print(f"C={C}: Random={prob_random:.4f}, Dynamic={prob_dynamic:.4f}", end="")
+            
+            if C == 8:
+                print(f", Theory={theory:.4f}, Ratio={prob_random/theory:.2f}x", end="")
+            print()
+
     plot_success_by_cluster_size(results)
-
-    # ---- PLOT 2: SUCCESS VS DEVICE COUNT (for each C) ----
     plot_success_by_device_count(results)
-
-    # ---- OPTIONAL: CDF PLOT FOR LAST SIMULATION ----
-    plot_success_cdf()    
-    # ---- TRAIN BEST PARAMETERS ----
-    if USE_ML:
-        subprocess.run(["python", "train_parameters.py"])
-        print("ML training complete. Updated best_params.json loaded next run.")
-
-        
+    plot_success_cdf()

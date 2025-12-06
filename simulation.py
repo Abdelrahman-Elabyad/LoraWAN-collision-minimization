@@ -14,10 +14,6 @@ MEAN_INTERARRIVAL = 600         # seconds per device
 TOTAL_PACKETS = 10000
 success_distances = []
 failure_distances = []
-DATASET_FILE = "channel_training_data.csv"
-
-USE_ML = False   # or True
-
 # -------- Information model configuration --------
 INFO_MODE = "HYBRID"      # "GLOBAL_DELAY" or "PER_DEVICE_DELAY" or "HYBRID"
 GLOBAL_UPDATE_INTERVAL = 4.0   # seconds
@@ -30,79 +26,32 @@ last_global_update = 0.0
 device_stats = None
 last_device_update = None
 
-# Thompson Sampling persistent state (global)
-# Global Thompson Sampling counters
-ts_alpha = None
-ts_beta  = None
-
-def reset_ts_counters(num_channels):
-    global ts_alpha, ts_beta
-    ts_alpha = np.ones(num_channels)
-    ts_beta  = np.ones(num_channels)
-
 # Global statistics for dynamic channel selection
 channel_stats = {
     ch: {
         'last_used': 0.0,
         'transmissions': 0,
         'collisions': 0,
-        'successes': 0
+        'successes': 0,
+        'ts_alpha': 1.0,  # ← ADD THIS
+        'ts_beta': 1.0    # ← ADD THIS
     }
     for ch in range(NUM_CHANNELS)
 }
 
+
 def reset_channel_stats():
+    """Reset all channel statistics including TS counters."""
+    global channel_stats
     for ch in range(NUM_CHANNELS):
         channel_stats[ch] = {
             'last_used': 0.0,
             'transmissions': 0,
             'collisions': 0,
-            'successes': 0
+            'successes': 0,
+            'ts_alpha': 1.0,  # Reset TS
+            'ts_beta': 1.0
         }
-    reset_ts_counters(NUM_CHANNELS)   # <-- IMPORTANT
-
-if USE_ML:
-    def initialize_dataset():
-        if not os.path.exists(DATASET_FILE):
-            with open(DATASET_FILE, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "time", 
-                    "channel",
-                    "lru_score", 
-                    "load_score", 
-                    "collision_score",
-                    "score",
-                    "probability",
-                    "success",
-                    "distance",
-                    "rx",
-                    "alpha", "beta", "gamma", "lambda"
-                ])
-
-    def append_training_data(
-            time, channel, lru_score, load_score, collision_score,
-            score, probability, success, distance, rx):
-
-        header = [
-            "time","channel",
-            "lru_score","load_score","collision_score",
-            "score","probability","success",
-            "distance","rx"
-        ]
-
-        new_file = not os.path.exists(DATASET_FILE)
-
-        with open(DATASET_FILE, "a", newline="") as f:
-            writer = csv.writer(f)
-            if new_file:
-                writer.writerow(header)
-            writer.writerow([
-                time, channel,
-                lru_score, load_score, collision_score,
-                score, probability, success,
-                distance, rx
-            ])
 
 # ----------------------------------------------------
 # DEVICE GENERATION
@@ -196,41 +145,31 @@ def check_collision(channel_packets, timestamp, end_time, RX):
 # MAIN SIMULATION
 # ----------------------------------------------------
 
-def run_simulation(N,distances,RX, clusters, cluster_channels, select_channel_fn):
+def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn):
     import heapq
-    global success_distances, failure_distances
     global stale_stats, last_global_update, device_stats, last_device_update
-
-    success_distances = []
-    failure_distances = []
-
+    success_distances = []  
+    failure_distances = [] 
     # Reset stats
     reset_channel_stats()
 
-    reset_ts_counters(NUM_CHANNELS)
-
-    # Initialize stale views
+    # Initialize STALE VIEWS (these get periodic updates)
     stale_stats = copy.deepcopy(channel_stats)
     last_global_update = 0.0
 
     device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
     last_device_update = [0.0 for _ in range(N)]
 
-    #generate arrivals
     arrivals = generate_arrivals(N)
-
-    # Ongoing packets per channel
     ongoing = [[] for _ in range(NUM_CHANNELS)]
-
-    # ---------- EVENT QUEUE ----------
     event_queue = []
 
-    # Insert all arrival events NOW
+    # Insert packet arrivals
     for t in arrivals:
-        dev = np.random.randint(0, N)    # SAME as before
+        dev = np.random.randint(0, N)
         heapq.heappush(event_queue, (t, "arrival", dev))
 
-    # Insert periodic global updates
+    # Insert periodic global updates (Class B downlinks)
     if INFO_MODE in ["GLOBAL_DELAY", "HYBRID"]:
         next_global = GLOBAL_UPDATE_INTERVAL
         sim_end = arrivals[-1] + 10.0
@@ -240,87 +179,75 @@ def run_simulation(N,distances,RX, clusters, cluster_channels, select_channel_fn
 
     success = 0
 
-    # -------------- MAIN LOOP --------------
+    # -------------- MAIN EVENT LOOP --------------
     while event_queue:
         t, event_type, dev = heapq.heappop(event_queue)
 
-        # -------- DEVICE UPDATE EVENT --------
+        # -------- DEVICE UPDATE EVENT (ACK downlink) --------
         if event_type == "dev_update":
+            # Device receives updated stats via ACK downlink
             device_stats[dev] = copy.deepcopy(channel_stats)
             last_device_update[dev] = t
             continue
 
-        # -------- GLOBAL UPDATE EVENT --------
+        # -------- GLOBAL UPDATE EVENT (Class B downlink) --------
         if event_type == "global_update":
+            # Periodic broadcast to all devices
             stale_stats = copy.deepcopy(channel_stats)
             last_global_update = t
             continue
 
         # -------- PACKET ARRIVAL EVENT --------
         if event_type == "arrival":
-
             d_dev = distances[dev]
             cluster_id = clusters[dev]
             allowed = cluster_channels[cluster_id]
 
-            # -------- SELECT OBSERVED STATS (IDENTICAL TO OLD BEHAVIOR) --------
+            # -------- DETERMINE WHICH STALE VIEW TO USE --------
             if INFO_MODE == "GLOBAL_DELAY":
                 observed_stats = stale_stats
-
             elif INFO_MODE == "PER_DEVICE_DELAY":
                 observed_stats = device_stats[dev]
-
             elif INFO_MODE == "HYBRID":
+                # Use whichever is more recent
                 if last_device_update[dev] >= last_global_update:
                     observed_stats = device_stats[dev]
                 else:
                     observed_stats = stale_stats
-
             else:
                 raise ValueError("Invalid INFO_MODE")
 
-            # -------- CHANNEL SELECTION (UNCHANGED) --------
+            # -------- CHANNEL SELECTION (uses STALE data) --------
             channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats)
+
+            # Add this for debugging (only prints first 5 packets):
+            if success + (TOTAL_PACKETS - success) <= 5:  # First 5 packets
+                debug_info_model_snapshot(t, dev, channel, observed_stats, channel_stats)
 
             # Remove expired transmissions
             ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
 
             end_t = t + PACKET_DURATION
 
-            # Update stats
+            # -------- UPDATE GROUND TRUTH STATS (immediate) --------
             channel_stats[channel]['transmissions'] += 1
             channel_stats[channel]['last_used'] = t
 
-            # Collision
+            # Check collision
             ok = check_collision(ongoing[channel], t, end_t, RX[dev])
 
-            # Logging
-            if USE_ML:
-                append_training_data(
-                    time=t,
-                    channel=channel,
-                    lru_score=feat[0],
-                    load_score=feat[1],
-                    collision_score=feat[2],
-                    score=score,
-                    probability=prob,
-                    success=int(ok),
-                    distance=d_dev,
-                    rx=RX[dev]
-                )
-            # ----- Hybrid TS Update -----
-            # Only apply hybrid learning if the selector returned a scoring term
+            # -------- UPDATE TS COUNTERS (immediate, in ground truth) --------
             if len(feat) >= 4:
-                score_val = feat[3]    # contextual score
+                score_val = feat[3]
                 pseudo_success = max(score_val, 0)
-                pseudo_fail    = max(-score_val, 0)
+                pseudo_fail = max(-score_val, 0)
+                
+                # Update GROUND TRUTH TS counters
+                # These will be propagated to devices via delayed updates
+                channel_stats[channel]['ts_alpha'] += pseudo_success
+                channel_stats[channel]['ts_beta'] += pseudo_fail
 
-                ts_alpha[channel] += pseudo_success
-                ts_beta[channel]  += pseudo_fail
-            # If using random selection → no TS learning
-
-
-            # ----- Logging + success tracking -----
+            # Track success/failure
             if ok:
                 success += 1
                 channel_stats[channel]['successes'] += 1
@@ -328,14 +255,51 @@ def run_simulation(N,distances,RX, clusters, cluster_channels, select_channel_fn
             else:
                 channel_stats[channel]['collisions'] += 1
                 failure_distances.append(d_dev)
-
-                
-            # ---------- SCHEDULE DEVICE UPDATE ----------
+            # -------- SCHEDULE DEVICE UPDATE (ACK downlink) --------
             update_time = t + DEVICE_UPDATE_DELAY
             heapq.heappush(event_queue, (update_time, "dev_update", dev))
 
-    # Return success probability
     return success / TOTAL_PACKETS
+
+# ----------------------------------------------------
+# DEBUGGING FUNCTION TO VERIFY INFORMATION MODEL
+# ----------------------------------------------------
+
+def debug_info_model_snapshot(t, dev, channel, observed_stats, real_stats, ts_alpha, ts_beta):
+    """
+    Call this during simulation to verify stale vs real data.
+    Add this right after channel selection in your main loop.
+    """
+    print(f"\n{'='*60}")
+    print(f"Time: {t:.2f}s | Device: {dev} | Selected Channel: {channel}")
+    print(f"{'='*60}")
+    
+    print(f"\n📊 OBSERVED STATS (what device sees - DELAYED):")
+    obs = observed_stats[channel]
+    print(f"  Transmissions: {obs['transmissions']}")
+    print(f"  Successes: {obs['successes']}")
+    print(f"  Collisions: {obs['collisions']}")
+    print(f"  Last used: {obs['last_used']:.2f}s")
+    
+    print(f"\n🎯 REAL STATS (ground truth - CURRENT):")
+    real = real_stats[channel]
+    print(f"  Transmissions: {real['transmissions']}")
+    print(f"  Successes: {real['successes']}")
+    print(f"  Collisions: {real['collisions']}")
+    print(f"  Last used: {real['last_used']:.2f}s")
+    
+    print(f"\n🎲 THOMPSON SAMPLING COUNTERS (GLOBAL - IMMEDIATE):")
+    print(f"  Alpha (successes): {ts_alpha[channel]:.2f}")
+    print(f"  Beta (failures): {ts_beta[channel]:.2f}")
+    
+    print(f"\n⚠️  CONSISTENCY CHECK:")
+    if obs['transmissions'] == real['transmissions']:
+        print("  ✓ Observed = Real (NO DELAY)")
+    else:
+        delay = real['transmissions'] - obs['transmissions']
+        print(f"  ✓ Observed < Real by {delay} transmissions (DELAYED as expected)")
+    
+    print(f"{'='*60}")
 
 # ----------------------------------------------------
 # EXPERIMENTS & PLOTTING FUNCTIONS

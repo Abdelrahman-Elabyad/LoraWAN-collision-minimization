@@ -1,32 +1,6 @@
 import numpy as np
 import json
-from simulation import channel_stats, USE_ML
 import simulation 
-
-
-# Recommended static parameters for maximum success (without ML)
-# Old default static parameters
-# alpha = 1.0
-# beta = 0.5
-# gamma = 1.5
-# lambda_val = 1.0
-
-alpha = 1.5
-beta  = 0.2
-gamma = 2.0
-lambda_val = 3.0
-
-# If ML enabled, load optimized parameters
-if USE_ML:
-    try:
-        with open("best_params.json", "r") as f:
-            params = json.load(f)
-        alpha = params["alpha"]
-        beta = params["beta"]
-        gamma = params["gamma"]
-        lambda_val = params["lambda"]
-    except:
-        print("[WARNING] best_params.json not found → using default parameters.")
 
 # ----------------------------------------------------
 # STATIC CLUSTER ASSIGNMENT BASED ON DISTANCE/RX
@@ -90,84 +64,136 @@ def assign_clusters_quantile_stratified(d, RX, C, NUM_CHANNELS=8):
 LAMBDA_LRU = 0.25
 LAMBDA_OVER = 0.4
 def dynamic_select(allowed_channels, now, observed_stats):
-
+    """
+    Improved Thompson Sampling with probabilistic selection.
+    """
     candidate_channels = list(allowed_channels)
+    n_channels = len(candidate_channels)
+    
+    if n_channels == 1:
+        ch = candidate_channels[0]
+        return ch, [0, 0, 0, 0], 0.5, 1.0
 
     # ---------- 1. Extract context ----------
     lru_scores = {}
     load_fracs = {}
-    coll_rates = {}
+    success_rates = {}  # Changed from collision rates
 
     total_trans = sum(
-        max(observed_stats[ch]['transmissions'], 0)
+        max(observed_stats[ch]['transmissions'], 1)
         for ch in candidate_channels
     )
 
     for ch in candidate_channels:
         st = observed_stats[ch]
 
-        # LRU (larger = better)
+        # LRU
         if st['last_used'] > 0:
             lru_scores[ch] = now - st['last_used']
         else:
             lru_scores[ch] = now
 
-        # Load fraction (smaller = better)
-        load_fracs[ch] = (
-            st['transmissions'] / total_trans
-            if total_trans > 0 else 0.0
-        )
+        # Load fraction
+        load_fracs[ch] = st['transmissions'] / total_trans
 
-        # Collision rate (smaller = better)
+        # SUCCESS RATE (changed from collision rate)
         if st['transmissions'] > 0:
-            coll_rates[ch] = st['collisions'] / st['transmissions']
+            success_rates[ch] = st['successes'] / st['transmissions']
         else:
-            coll_rates[ch] = 0.0
+            success_rates[ch] = 0.5  # Unknown = neutral
 
-    max_lru = max(lru_scores.values()) if candidate_channels else 1.0
+    max_lru = max(lru_scores.values()) if lru_scores else 1.0
+    max_lru = max(max_lru, 1.0)
 
-    # ---------- 2. Thompson Sampling base ----------
-    theta_raw = []
+    # ---------- 2. Thompson Sampling ----------
+    theta_samples = []
     for ch in candidate_channels:
-        theta = np.random.beta(
-            simulation.ts_alpha[ch],
-            simulation.ts_beta[ch]
-        )
-        theta_raw.append(theta)
+        alpha = observed_stats[ch]['ts_alpha']
+        beta = observed_stats[ch]['ts_beta']
+        theta = np.random.beta(alpha, beta)
+        theta_samples.append(theta)
 
-    theta_raw = np.array(theta_raw)
+    theta_samples = np.array(theta_samples)
 
-    # ---------- 3. Scoring system (α, β, γ) ----------
+    # ---------- 3. Contextual scoring ----------
+    alpha_weight = 0.15   # LRU weight
+    beta_weight = 0.20    # SUCCESS rate weight (positive signal)
+    gamma_weight = 0.10   # Load penalty weight
+    lambda_val = 0.4
+
     score_components = []
     for ch in candidate_channels:
+        norm_lru = lru_scores[ch] / max_lru
+        load = load_fracs[ch]
+        success = success_rates[ch]
 
-        norm_lru  = lru_scores[ch] / max_lru
-        load      = load_fracs[ch]
-        coll      = coll_rates[ch]
-
-        S = alpha * norm_lru - beta * load - gamma * coll
-
+        # Contextual score: reward success, penalize load
+        S = alpha_weight * norm_lru + beta_weight * success - gamma_weight * load
         score_components.append(S)
 
     score_components = np.array(score_components)
+    
+    # Normalize to [-1, 1]
+    if score_components.max() - score_components.min() > 0:
+        score_components = (score_components - score_components.min()) / \
+                          (score_components.max() - score_components.min())
+        score_components = 2 * score_components - 1
+    else:
+        score_components = np.zeros_like(score_components)
 
-    # ---------- 4. Combine scoring + TS ----------
-    theta_final = theta_raw + lambda_val * score_components
+    # ---------- 4. Combine ----------
+    combined_scores = theta_samples + lambda_val * score_components
 
-    # ---------- 5. Pick best channel ----------
-    chosen_idx = np.argmax(theta_final)
+    # ---------- 5. Probabilistic selection ----------
+    temperature = 0.4  # Increased from 0.3 for more exploration
+    exp_scores = np.exp(combined_scores / temperature)
+    probabilities = exp_scores / exp_scores.sum()
+
+    chosen_idx = np.random.choice(len(candidate_channels), p=probabilities)
     chosen_channel = candidate_channels[chosen_idx]
 
-    # Return feature logs
     features = [
         lru_scores[chosen_channel],
         load_fracs[chosen_channel],
-        coll_rates[chosen_channel],
+        success_rates[chosen_channel],
         score_components[chosen_idx]
     ]
 
-    return chosen_channel, features, theta_final[chosen_idx], 1.0
+    return chosen_channel, features, combined_scores[chosen_idx], probabilities[chosen_idx]
 
+def dynamic_select(allowed_channels, now, observed_stats, epsilon=None):
+    """
+    Adaptive epsilon-greedy with load-based exploration.
+    At high loads (many transmissions), increase exploration to combat stale data.
+    """
+    candidate_channels = list(allowed_channels)
+    
+    if len(candidate_channels) == 1:
+        ch = candidate_channels[0]
+        return ch, [0, 0, 0, 0], 0.5, 1.0
+    
+    # ADAPTIVE EPSILON: Increase with network load
+    if epsilon is None:
+        # Count total transmissions across all candidate channels
+        total_trans = sum(max(observed_stats[ch]['transmissions'], 0) 
+                         for ch in candidate_channels)
+        
+        # Base epsilon + load-based increase
+        base_epsilon = 0.25
+        load_bonus = min(total_trans / 5000.0, 0.25)  # Up to +0.25
+        epsilon = base_epsilon + load_bonus
+        
+        # Cap at 0.5 (50% exploration max)
+        epsilon = min(epsilon, 0.5)
+    
+    # Epsilon-greedy decision
+    if np.random.random() < epsilon:
+        # EXPLORE: Random selection
+        chosen_channel = np.random.choice(candidate_channels)
+        return chosen_channel, [0, 0, 0, 0], 0.5, 1.0 / len(candidate_channels)
+    
+    # EXPLOIT: Use Thompson Sampling
+    return dynamic_select(allowed_channels, now, observed_stats)
 
 
 
