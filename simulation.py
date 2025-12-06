@@ -30,6 +30,15 @@ last_global_update = 0.0
 device_stats = None
 last_device_update = None
 
+# Thompson Sampling persistent state (global)
+# Global Thompson Sampling counters
+ts_alpha = None
+ts_beta  = None
+
+def reset_ts_counters(num_channels):
+    global ts_alpha, ts_beta
+    ts_alpha = np.ones(num_channels)
+    ts_beta  = np.ones(num_channels)
 
 # Global statistics for dynamic channel selection
 channel_stats = {
@@ -50,6 +59,8 @@ def reset_channel_stats():
             'collisions': 0,
             'successes': 0
         }
+    reset_ts_counters(NUM_CHANNELS)   # <-- IMPORTANT
+
 if USE_ML:
     def initialize_dataset():
         if not os.path.exists(DATASET_FILE):
@@ -185,7 +196,7 @@ def check_collision(channel_packets, timestamp, end_time, RX):
 # MAIN SIMULATION
 # ----------------------------------------------------
 
-def run_simulation(N, clusters, cluster_channels, select_channel_fn):
+def run_simulation(N,distances,RX, clusters, cluster_channels, select_channel_fn):
     import heapq
     global success_distances, failure_distances
     global stale_stats, last_global_update, device_stats, last_device_update
@@ -196,6 +207,8 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
     # Reset stats
     reset_channel_stats()
 
+    reset_ts_counters(NUM_CHANNELS)
+
     # Initialize stale views
     stale_stats = copy.deepcopy(channel_stats)
     last_global_update = 0.0
@@ -203,8 +216,7 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
     device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
     last_device_update = [0.0 for _ in range(N)]
 
-    # Device positions + arrivals
-    distances, RX = generate_devices(N)
+    #generate arrivals
     arrivals = generate_arrivals(N)
 
     # Ongoing packets per channel
@@ -296,7 +308,19 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
                     distance=d_dev,
                     rx=RX[dev]
                 )
+            # ----- Hybrid TS Update -----
+            # Only apply hybrid learning if the selector returned a scoring term
+            if len(feat) >= 4:
+                score_val = feat[3]    # contextual score
+                pseudo_success = max(score_val, 0)
+                pseudo_fail    = max(-score_val, 0)
 
+                ts_alpha[channel] += pseudo_success
+                ts_beta[channel]  += pseudo_fail
+            # If using random selection → no TS learning
+
+
+            # ----- Logging + success tracking -----
             if ok:
                 success += 1
                 channel_stats[channel]['successes'] += 1
@@ -305,6 +329,7 @@ def run_simulation(N, clusters, cluster_channels, select_channel_fn):
                 channel_stats[channel]['collisions'] += 1
                 failure_distances.append(d_dev)
 
+                
             # ---------- SCHEDULE DEVICE UPDATE ----------
             update_time = t + DEVICE_UPDATE_DELAY
             heapq.heappush(event_queue, (update_time, "dev_update", dev))
