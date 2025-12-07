@@ -9,13 +9,13 @@ from genetic_cluster_optimizer import optimize_clusters_with_GA, USE_MULTIPROCES
 # RUN PLAN — how many GA runs you want for each device count N
 # ------------------------------------------------------------
 RUN_PLAN = {
-    200:   5,
-    500:   5,
-    1000:  5,
-    2000:  4,
-    5000:  3,
-    10000: 2,
-    20000: 1,
+    #200:   5,
+    #500:   5,
+    #1000:  5,
+    #2000:  4,
+    #5000:  3,
+    10000: 5,
+    #20000: 1,
 }
 
 # ------------------------------------------------------------
@@ -27,10 +27,6 @@ CLUSTER_SIZES = [1, 2, 4]
 # OPTIONAL: Clear old master dataset before starting
 # ------------------------------------------------------------
 MASTER_DATASET = "GA_dataset_master.csv"
-if os.path.exists(MASTER_DATASET):
-    print(f"[INFO] Removing old dataset: {MASTER_DATASET}")
-    os.remove(MASTER_DATASET)
-
 
 # ------------------------------------------------------------
 # MAIN EXECUTION LOOP
