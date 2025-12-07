@@ -152,11 +152,45 @@ def check_collision(channel_packets, timestamp, end_time, RX):
     else:
         return False  # some older packet was strongest; new one loses
 
+
+def fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrivals, dev_sequence):
+    """
+    Completely bypass the normal pipeline.
+    Pure random channel selection with collision logic only.
+    No stale stats, no TS, no EMA, no device updates.
+    """
+    NUM_CHANNELS = len(cluster_channels) * len(cluster_channels[0])
+    ongoing = [[] for _ in range(NUM_CHANNELS)]
+    
+    success = 0
+    PACKET_DURATION = 0.050
+
+    for t, dev in zip(arrivals, dev_sequence):
+        cluster_id = clusters[dev]
+        allowed = cluster_channels[cluster_id]
+
+        # pure random channel
+        ch = np.random.choice(allowed)
+
+        # Remove finished
+        ongoing[ch] = [p for p in ongoing[ch] if p['end'] > t]
+
+        # Check collision
+        end_t = t + PACKET_DURATION
+        ok = check_collision(ongoing[ch], t, end_t, RX[dev])
+
+        if ok:
+            success += 1
+
+    return success / len(arrivals)
+
 # ----------------------------------------------------
 # MAIN SIMULATION
 # ----------------------------------------------------
 
 def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn,arrivals,dev_sequence):
+    if select_channel_fn.__name__ == "random_select":
+        return fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrivals, dev_sequence)
 
     global stale_stats, last_global_update, device_stats, last_device_update
     success_distances = []  

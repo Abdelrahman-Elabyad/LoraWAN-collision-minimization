@@ -173,6 +173,7 @@ def random_small_mutation(child, K, count=3):
 # ----------------------------------------------------
 # Main GA Function
 # ----------------------------------------------------
+
 def optimize_clusters_with_GA(N, C):
     print(f"\n=== Running GA for N={N}, C={C} ===")
 
@@ -185,6 +186,9 @@ def optimize_clusters_with_GA(N, C):
 
     POP_SIZE = params["POP_SIZE"]
     GENERATIONS = params["GENERATIONS"]
+    MIN_GEN = GENERATIONS                           # must run at least this many
+    MAX_GEN = GENERATIONS + 40                      # or choose GENERATIONS * 2
+    EARLY_STOP_PATIENCE = 10                        # no improvement threshold
     MAX_MUT = params["MAX_MUT"]
     MUT_RATE = params["MUT_RATE"]
     TOURNAMENT_SIZE = params["TOURNAMENT"]
@@ -193,6 +197,7 @@ def optimize_clusters_with_GA(N, C):
     R_NORMAL = params["R_NORMAL"]
     R_STRONG = params["R_STRONG"]
     R_RANDOM = params["R_RANDOM"]
+    
 
     print(f"GA Parameters: POP={POP_SIZE}, GEN={GENERATIONS}, "
           f"MUT={MUT_RATE}, MAX_MUT={MAX_MUT}, "
@@ -210,32 +215,38 @@ def optimize_clusters_with_GA(N, C):
 
     best_fitness = -1
     best_genome = None
-
+    no_improve_count = 0
     # -------------------------------
     # GA EVOLUTION LOOP
     # -------------------------------
-    for gen in range(GENERATIONS):
+    for gen in range(1, MAX_GEN + 1):
 
         # Fitness evaluation
         if USE_MULTIPROCESSING:
-            args_list = [
-                (genome, cluster_channels, N, d, RX, C, arrivals, dev_sequence)
-                for genome in population
-            ]
+            args_list = [(genome, cluster_channels, N, d, RX, C, arrivals, dev_sequence)for genome in population]
             with mp.Pool() as pool:
                 fitness = pool.map(_eval_worker, args_list)
         else:
-            fitness = [evaluate_genome(g, cluster_channels, N, d, RX, C, arrivals, dev_sequence)
-                       for g in population]
+            fitness = [evaluate_genome(g, cluster_channels, N, d, RX, C, arrivals, dev_sequence)for g in population]
 
         # Track best genome
         gen_best_idx = np.argmax(fitness)
         if fitness[gen_best_idx] > best_fitness:
             best_fitness = fitness[gen_best_idx]
             best_genome = population[gen_best_idx].copy()
+            no_improve_count = 0          # reset counter on improvement
+        else:
+            no_improve_count += 1         # increment if no improvement
 
-        print(f"Generation {gen+1}/{GENERATIONS} → Best Fitness = {best_fitness:.4f}")
+        print(f"Generation {gen}/{MAX_GEN} → Best Fitness = {best_fitness:.4f} "f"(no improvement = {no_improve_count})")
 
+        # -------------------------------
+        # EARLY STOPPING CHECK
+        # -------------------------------
+        if gen >= MIN_GEN and no_improve_count >= EARLY_STOP_PATIENCE:
+            print(f"\n🟡 EARLY STOPPING TRIGGERED at Gen {gen} — "
+                f"no improvement for {EARLY_STOP_PATIENCE} generations.\n")
+            break
         # ELITISM
         sorted_idx = np.argsort(fitness)[::-1]
         new_population = [population[i].copy() for i in sorted_idx[:ELITE_COUNT]]
@@ -253,6 +264,7 @@ def optimize_clusters_with_GA(N, C):
             p1 = tournament_select(population, fitness, TOURNAMENT_SIZE)
             p2 = tournament_select(population, fitness, TOURNAMENT_SIZE)
 
+            #create children (CROSSOVER)
             c1, c2 = crossover(p1, p2)
 
             # NORMAL mutation = 80% swap, 20% tiny random mutation
@@ -291,9 +303,9 @@ def optimize_clusters_with_GA(N, C):
 
     # FINISH
     print("\n======= GA Finished =======")
-    print(f"Generation {gen+1}/{GENERATIONS} → "
-          f"GenBest = {max(fitness):.4f}, "
-          f"GlobalBest = {best_fitness:.4f}")
+    print(f"Stopped at Generation {gen}/{MAX_GEN}")
+    print(f"Best Genome Fitness = {best_fitness:.4f}")
+
 
     np.save(f"best_genome_N{N}_C{C}.npy", best_genome)
     print(f"[SAVED] best_genome_N{N}_C{C}.npy")
