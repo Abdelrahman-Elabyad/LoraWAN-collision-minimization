@@ -7,7 +7,7 @@ import heapq
 # ----------------------------------------------------
 RADIUS = 1.0                    # km
 NUM_CHANNELS = 8
-PACKET_DURATION = 0.050         # 50 ms
+PACKET_DURATION = 0.200         # 50 ms
 MEAN_INTERARRIVAL = 600         # seconds per device
 TOTAL_PACKETS = 10000
 success_distances = []
@@ -68,25 +68,40 @@ def reset_channel_stats():
 # DEVICE GENERATION
 # ----------------------------------------------------
 def generate_devices(N):
-    """Generate N devices uniformly in a disk, return distances + RX."""
+    """
+    Generate N devices uniformly in a disk of radius RADIUS.
+    Returns:
+        d  = distances from gateway (km)
+        RX = received power (dBm)
+        pos = Nx2 array of coordinates [[x1,y1], ...]
+    """
+
+    # Uniform distribution in a circle
     U = np.random.rand(N)
     r = np.sqrt(U) * RADIUS
     theta = 2 * np.pi * np.random.rand(N)
 
+    # Convert polar → Cartesian
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+
+    positions = np.column_stack([x, y])
+
     # Distance in km
     d = r
 
-    # Convert to meters for PL formula
+    # Convert to meters for path loss
     d_m = d * 1000
 
-    # Path loss
-    PL = 40 + 27 * np.log10(d_m)
+    # Path loss model
+    PL = 40 + 27 * np.log10(d_m + 1e-9)   # avoid log(0)
 
     # Transmit power
-    TP = 5  # dBm
+    TP = 5   # dBm
     RX = TP - PL
 
-    return d, RX
+    return d, RX, positions
+
 # ----------------------------------------------------
 # ARRIVAL PROCESS (AGGREGATE POISSON)
 # ----------------------------------------------------
@@ -153,16 +168,19 @@ def check_collision(channel_packets, timestamp, end_time, RX):
         return False  # some older packet was strongest; new one loses
 
 
+# ONLY CHANGE THIS FUNCTION IN YOUR simulation.py
+
 def fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrivals, dev_sequence):
     """
-    Completely bypass the normal pipeline.
-    Pure random channel selection with collision logic only.
-    No stale stats, no TS, no EMA, no device updates.
+    Pure random channel selection with collision logic.
+    NOW TRACKS distances for CDF plots.
     """
     NUM_CHANNELS = len(cluster_channels) * len(cluster_channels[0])
     ongoing = [[] for _ in range(NUM_CHANNELS)]
     
     success = 0
+    success_distances = []  # ← ADD THIS
+    failure_distances = []  # ← ADD THIS
     PACKET_DURATION = 0.050
 
     for t, dev in zip(arrivals, dev_sequence):
@@ -181,8 +199,11 @@ def fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrival
 
         if ok:
             success += 1
+            success_distances.append(distances[dev])  # ← ADD THIS
+        else:
+            failure_distances.append(distances[dev])  # ← ADD THIS
 
-    return success / len(arrivals)
+    return success / TOTAL_PACKETS, success_distances, failure_distances  # ← CHANGE THIS LINE
 
 # ----------------------------------------------------
 # MAIN SIMULATION
@@ -328,11 +349,18 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
             heapq.heappush(event_queue, (update_time, "dev_update", dev))
 
 
-    return success / TOTAL_PACKETS
+    return success / TOTAL_PACKETS, success_distances, failure_distances
 
 # ----------------------------------------------------
 # PLOTTING FUNCTIONS
 # ----------------------------------------------------
+def compute_cdf(values):
+    if values is None or len(values) == 0:
+        return None, None
+
+    xs = np.sort(values)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    return xs, ys
 
 def plot_success_vs_C(results, title="Success vs Cluster Size"):
     Cs = sorted(results.keys())

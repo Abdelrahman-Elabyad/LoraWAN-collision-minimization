@@ -5,6 +5,7 @@ import multiprocessing as mp
 from simulation import generate_arrivals, run_simulation, generate_devices, reset_channel_stats
 from clustering_channel_assignment import random_select
 from clustering_channel_assignment import assign_clusters_quantile_stratified
+import pandas as pd
 # ----------------------------------------------------
 # Genetic Algorithm Parameters
 # ----------------------------------------------------
@@ -23,22 +24,22 @@ def auto_select_mode(N):
 def get_ga_params(N, GA_MODE):
     
     if N <= 300:
-        base = {"POP_SIZE": 15, "GENERATIONS": 12, "MAX_MUT": 3, "MUT_RATE": 0.01, "TOURNAMENT": 3, "ELITE": 2}
+        base = {"POP_SIZE": 50, "GENERATIONS": 100, "MAX_MUT": 3, "MUT_RATE": 0.01, "TOURNAMENT": 3, "ELITE": 2}
 
     elif N <= 800:
-        base = {"POP_SIZE": 18, "GENERATIONS": 15, "MAX_MUT": 4, "MUT_RATE": 0.01, "TOURNAMENT": 3, "ELITE": 2}
+        base = {"POP_SIZE": 50, "GENERATIONS": 100, "MAX_MUT": 4, "MUT_RATE": 0.01, "TOURNAMENT": 3, "ELITE": 2}
 
     elif N <= 2000:
-        base = {"POP_SIZE": 22, "GENERATIONS": 20, "MAX_MUT": 6, "MUT_RATE": 0.008, "TOURNAMENT": 4, "ELITE": 2}
+        base = {"POP_SIZE": 50, "GENERATIONS": 150, "MAX_MUT": 6, "MUT_RATE": 0.008, "TOURNAMENT": 4, "ELITE": 2}
 
     elif N <= 6000:
-        base = {"POP_SIZE": 30, "GENERATIONS": 25, "MAX_MUT": 10, "MUT_RATE": 0.006, "TOURNAMENT": 4, "ELITE": 2}
+        base = {"POP_SIZE": 100, "GENERATIONS": 300, "MAX_MUT": 10, "MUT_RATE": 0.006, "TOURNAMENT": 4, "ELITE": 2}
 
     elif N <= 12000:
-        base = {"POP_SIZE": 35, "GENERATIONS": 30, "MAX_MUT": 12, "MUT_RATE": 0.005, "TOURNAMENT": 5, "ELITE": 2}
+        base = {"POP_SIZE": 100, "GENERATIONS": 400, "MAX_MUT": 12, "MUT_RATE": 0.005, "TOURNAMENT": 5, "ELITE": 2}
 
     else:  # N > 12000
-        base = {"POP_SIZE": 40, "GENERATIONS": 35, "MAX_MUT": 20, "MUT_RATE": 0.004, "TOURNAMENT": 5, "ELITE": 3}
+        base = {"POP_SIZE": 100, "GENERATIONS": 500, "MAX_MUT": 20, "MUT_RATE": 0.004, "TOURNAMENT": 5, "ELITE": 3}
 
     # ---------- MODE PARAMETERS ----------
     if GA_MODE == "balanced":
@@ -67,7 +68,7 @@ def build_cluster_channels(C):
 # Fitness Function
 # ----------------------------------------------------
 def evaluate_genome(genome,cluster_channels, N, d, RX, C,arrivals,dev_sequence):
-    success_prob = run_simulation(N,d,RX,genome,cluster_channels,random_select,arrivals,dev_sequence)
+    success_prob, _, _ = run_simulation(N,d,RX,genome,cluster_channels,random_select,arrivals,dev_sequence)
     return success_prob
 
 def _eval_worker(args):
@@ -92,7 +93,7 @@ def initialize_population(N, K, d, RX, C, POP_SIZE, MUT_RATE, MAX_MUT):
     num_random = POP_SIZE - num_stratified
 
     # ---------- 1. Base stratified genome ----------
-    clusters, _ = assign_clusters_quantile_stratified(d, RX, C)
+    clusters= assign_clusters_quantile_stratified(d, RX, C)
     population.append(clusters.copy())
 
     # ---------- 2. Mutated versions of the stratified seed ----------
@@ -174,7 +175,7 @@ def random_small_mutation(child, K, count=3):
 # Main GA Function
 # ----------------------------------------------------
 
-def optimize_clusters_with_GA(N, C):
+def optimize_clusters_with_GA(N, C, d, RX, positions, arrivals, dev_sequence):
     print(f"\n=== Running GA for N={N}, C={C} ===")
 
     # AUTO-SELECT MODE
@@ -186,14 +187,14 @@ def optimize_clusters_with_GA(N, C):
 
     POP_SIZE = params["POP_SIZE"]
     GENERATIONS = params["GENERATIONS"]
-    MIN_GEN = GENERATIONS                           # must run at least this many
-    MAX_GEN = GENERATIONS + 40                      # or choose GENERATIONS * 2
-    EARLY_STOP_PATIENCE = 10                        # no improvement threshold
+    MIN_GEN = 100                           # must run at least this many
+    MAX_GEN = GENERATIONS + 50                           # max generations
+    EARLY_STOP_PATIENCE = 20                       # no improvement threshold
     MAX_MUT = params["MAX_MUT"]
     MUT_RATE = params["MUT_RATE"]
     TOURNAMENT_SIZE = params["TOURNAMENT"]
     ELITE_COUNT = params["ELITE"]
-
+    PERFECT_FITNESS_THRESHOLD = 1.0
     R_NORMAL = params["R_NORMAL"]
     R_STRONG = params["R_STRONG"]
     R_RANDOM = params["R_RANDOM"]
@@ -204,12 +205,9 @@ def optimize_clusters_with_GA(N, C):
           f"Tourn={TOURNAMENT_SIZE}, Elite={ELITE_COUNT}, "
           f"Mode={GA_MODE}")
 
-    # Generate device geometry
-    d, RX = generate_devices(N)
-    arrivals = generate_arrivals(N)
+    x = positions[:, 0]
+    y = positions[:, 1]
     cluster_channels, K = build_cluster_channels(C)
-    dev_sequence = np.random.randint(0, N, size=len(arrivals))
-
     # Initialize population (now adaptive)
     population = initialize_population(N, K, d, RX, C, POP_SIZE, MUT_RATE, MAX_MUT)
 
@@ -241,11 +239,19 @@ def optimize_clusters_with_GA(N, C):
         print(f"Generation {gen}/{MAX_GEN} → Best Fitness = {best_fitness:.4f} "f"(no improvement = {no_improve_count})")
 
         # -------------------------------
-        # EARLY STOPPING CHECK
+        # STOPPING CONDITIONS
         # -------------------------------
+        
+        # Condition 1: Perfect fitness reached
+        if best_fitness >= PERFECT_FITNESS_THRESHOLD:
+            print(f"\n🎯 PERFECT FITNESS REACHED at Gen {gen}!")
+            print(f"Fitness = {best_fitness:.4f} >= {PERFECT_FITNESS_THRESHOLD}")
+            break
+        
+        # Condition 2: No improvement after MIN_GEN with patience exceeded
         if gen >= MIN_GEN and no_improve_count >= EARLY_STOP_PATIENCE:
-            print(f"\n🟡 EARLY STOPPING TRIGGERED at Gen {gen} — "
-                f"no improvement for {EARLY_STOP_PATIENCE} generations.\n")
+            print(f"\n🟡 EARLY STOPPING TRIGGERED at Gen {gen}")
+            print(f"No improvement for {EARLY_STOP_PATIENCE} generations after {MIN_GEN} minimum.")
             break
         # ELITISM
         sorted_idx = np.argsort(fitness)[::-1]
@@ -301,27 +307,67 @@ def optimize_clusters_with_GA(N, C):
 
         population = new_population[:POP_SIZE]
 
-    # FINISH
-    print("\n======= GA Finished =======")
-    print(f"Stopped at Generation {gen}/{MAX_GEN}")
-    print(f"Best Genome Fitness = {best_fitness:.4f}")
+    # =============================
+    # FINAL EVALUATION WITH CDF
+    # =============================
+    print("\n[GA] Evolution complete. Running FINAL evaluation with CDF tracking...")
+    reset_channel_stats()
+    final_score, success_distances, failure_distances = run_simulation(
+        N, d, RX, best_genome, cluster_channels, random_select, arrivals, dev_sequence
+    )
 
+    print(f"[GA] Final evaluation score: {final_score:.4f}")
+    
+    if success_distances is not None:
+        print(f"[GA] Success distances tracked: {len(success_distances)} packets")
+        print(f"[GA] Failure distances tracked: {len(failure_distances)} packets")
+    else:
+        print(f"[GA] WARNING: Distance tracking returned None!")
+        success_distances = []
+        failure_distances = []
 
+    # Save best genome
     np.save(f"best_genome_N{N}_C{C}.npy", best_genome)
     print(f"[SAVED] best_genome_N{N}_C{C}.npy")
 
-    # Append dataset
+    # Save to master dataset
     master_csv = "GA_dataset_master.csv"
+
+    if os.path.exists(master_csv):
+        df_tmp = pd.read_csv(master_csv)
+        if "network_id" in df_tmp.columns and len(df_tmp) > 0:
+            network_id = int(df_tmp["network_id"].iloc[-1]) + 1
+        else:
+            network_id = 0
+    else:
+        network_id = 0
+
     write_header = not os.path.exists(master_csv)
 
     with open(master_csv, "a", newline="") as f:
         writer = csv.writer(f)
+
         if write_header:
-            writer.writerow(["N", "device_id", "d", "RX", "C", "cluster_optimal"])
+            writer.writerow([
+                "network_id", "N", "device_id",
+                "d", "RX", "C", "cluster_optimal",
+                "x", "y"
+            ])
+
         for i in range(N):
-            writer.writerow([N, i, float(d[i]), float(RX[i]), C, int(best_genome[i])])
+            writer.writerow([
+                network_id,
+                N,
+                i,
+                float(d[i]),
+                float(RX[i]),
+                C,
+                int(best_genome[i]),
+                float(x[i]),
+                float(y[i])
+            ])
 
-    print(f"[APPENDED] Added best genome data to {master_csv}")
-    print("\n== GA Completed Successfully ==")
+    print(f"[APPENDED] Added best genome data to {master_csv} with network_id={network_id}")
+    print("\n== GA Completed Successfully ==\n")
 
-    return best_genome, best_fitness
+    return best_genome, final_score, success_distances, failure_distances

@@ -1,0 +1,4 @@
+run_id,N,C,ga_time_seconds,total_time_seconds,ga_time_formatted,total_time_formatted
+1,6000,1,421.34,422.65,7.02m (421.34s),7.04m (422.65s)
+1,6000,1,315.89,317.13,5.26m (315.89s),5.29m (317.13s)
+1,200,1,51.46,52.36,51.46s,52.36s
