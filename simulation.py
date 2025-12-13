@@ -7,7 +7,7 @@ import heapq
 # ----------------------------------------------------
 RADIUS = 1.0                    # km
 NUM_CHANNELS = 8
-PACKET_DURATION = 0.200         # 50 ms
+PACKET_DURATION = 0.050         # 50 ms
 MEAN_INTERARRIVAL = 600         # seconds per device
 TOTAL_PACKETS = 10000
 success_distances = []
@@ -119,119 +119,126 @@ def generate_arrivals(N):
 # ----------------------------------------------------
 # COLLISION & CAPTURE CHECK
 # ----------------------------------------------------
-
-def check_collision(channel_packets, timestamp, end_time, RX):
-    """Apply collision/capture rule for a single new packet.
-       Returns True if the NEW packet succeeds, False otherwise.
+def check_collision_batch(packets_on_channel):
     """
+    Batch collision evaluation - processes all overlapping packets together.
+    This is the new collision detection that replaces the old incremental approach.
+    
+    Args:
+        packets_on_channel: List of packet dicts with 'start', 'end', 'rx', 'success' keys
+    
+    Returns:
+        None (modifies packets in-place by setting 'success' field)
+    """
+    if not packets_on_channel:
+        return
+    
+    # Sort by start time
+    packets_on_channel.sort(key=lambda p: p['start'])
+    
+    # Find overlapping groups
+    i = 0
+    while i < len(packets_on_channel):
+        group = [packets_on_channel[i]]
+        end_time = packets_on_channel[i]['end']
+        
+        # Collect all overlapping packets
+        j = i + 1
+        while j < len(packets_on_channel) and packets_on_channel[j]['start'] < end_time:
+            group.append(packets_on_channel[j])
+            end_time = max(end_time, packets_on_channel[j]['end'])
+            j += 1
+        
+        # Evaluate this group
+        if len(group) == 1:
+            # No collision - packet succeeds
+            group[0]['success'] = True
+        else:
+            # Collision scenario - check for capture effect
+            powers = [p['rx'] for p in group]
+            max_rx = max(powers)
+            
+            # Check if strongest dominates by 3dB
+            capture_ok = all(max_rx - rx >= 3.0 for rx in powers if rx != max_rx)
+            
+            if capture_ok:
+                # Strongest wins
+                winner_idx = powers.index(max_rx)
+                group[winner_idx]['success'] = True
+            # else: all fail (default is False)
+        
+        i = j
 
-    # Find overlapping packets
-    # A packet overlaps if it starts before the new packet ends
-    # and ends after the new packet starts.
-    #this list contains all the pakcets that havent finished yet
-    overlaps = [p for p in channel_packets
-                if not (p['end'] <= timestamp or p['start'] >= end_time)]
-
-    new_packet = {'start': timestamp, 'end': end_time, 'RX': RX}
-
-    if len(overlaps) == 0:
-        # No collision → new packet succeeds
-        channel_packets.append(new_packet)
-        return True
-
-    # There is at least one overlapping packet → collision scenario
-    all_packets = overlaps + [new_packet]
-    powers = [p['RX'] for p in all_packets]
-    strongest = max(powers)
-    idx_strongest = powers.index(strongest)
-
-    # Check if strongest dominates all others by >= 3 dB
-    dominates = True
-    for pwr in powers:
-        if strongest - pwr < 3 and pwr != strongest:
-            dominates = False
-            break
-
-    # Add the new packet to the ongoing list (it occupies the air)
-    channel_packets.append(new_packet)
-
-    if not dominates:
-        # No packet clearly wins → treat as collision, new packet fails
-        return False
-
-    # There is exactly one dominant strongest packet.
-    # NEW packet succeeds only if it is that strongest one.
-    index_new = len(all_packets) - 1  # new packet is last in all_packets
-    if idx_strongest == index_new:
-        return True   # new packet is strongest and dominates
-    else:
-        return False  # some older packet was strongest; new one loses
-
-
-# ONLY CHANGE THIS FUNCTION IN YOUR simulation.py
 
 def fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrivals, dev_sequence):
     """
-    Pure random channel selection with collision logic.
-    NOW TRACKS distances for CDF plots.
+    Pure random channel selection with batch collision detection.
+    NOW uses realistic batch collision evaluation like the competitor.
+    Tracks distances for CDF plots.
     """
     NUM_CHANNELS = len(cluster_channels) * len(cluster_channels[0])
-    ongoing = [[] for _ in range(NUM_CHANNELS)]
     
-    success = 0
-    success_distances = []  # ← ADD THIS
-    failure_distances = []  # ← ADD THIS
-    PACKET_DURATION = 0.050
-
+    # Generate all packets first
+    packets_by_channel = {ch: [] for ch in range(NUM_CHANNELS)}
+    
     for t, dev in zip(arrivals, dev_sequence):
         cluster_id = clusters[dev]
         allowed = cluster_channels[cluster_id]
-
-        # pure random channel
+        
+        # Pure random channel selection
         ch = np.random.choice(allowed)
+        
+        # Create packet
+        packet = {
+            'device_id': dev,
+            'start': t,
+            'end': t + PACKET_DURATION,
+            'rx': RX[dev],
+            'distance': distances[dev],
+            'success': False  # Will be updated by collision detection
+        }
+        
+        packets_by_channel[ch].append(packet)
+    
+    # Evaluate collisions using batch processing
+    for ch in range(NUM_CHANNELS):
+        check_collision_batch(packets_by_channel[ch])
+    
+    # Collect results
+    all_packets = []
+    for ch in range(NUM_CHANNELS):
+        all_packets.extend(packets_by_channel[ch])
+    
+    success = sum(1 for p in all_packets if p['success'])
+    success_distances = [p['distance'] for p in all_packets if p['success']]
+    failure_distances = [p['distance'] for p in all_packets if not p['success']]
+    
+    return success / len(all_packets), success_distances, failure_distances
 
-        # Remove finished
-        ongoing[ch] = [p for p in ongoing[ch] if p['end'] > t]
 
-        # Check collision
-        end_t = t + PACKET_DURATION
-        ok = check_collision(ongoing[ch], t, end_t, RX[dev])
-
-        if ok:
-            success += 1
-            success_distances.append(distances[dev])  # ← ADD THIS
-        else:
-            failure_distances.append(distances[dev])  # ← ADD THIS
-
-    return success / TOTAL_PACKETS, success_distances, failure_distances  # ← CHANGE THIS LINE
-
-# ----------------------------------------------------
-# MAIN SIMULATION
-# ----------------------------------------------------
-
-def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn,arrivals,dev_sequence):
+def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_fn, arrivals, dev_sequence):
+    """
+    Main simulation function with batch collision detection.
+    Works with dynamic channel selection functions.
+    """
     if select_channel_fn.__name__ == "random_select":
         return fast_random_simulation(N, distances, RX, clusters, cluster_channels, arrivals, dev_sequence)
 
     global stale_stats, last_global_update, device_stats, last_device_update
-    success_distances = []  
-    failure_distances = [] 
+    
     # Reset stats
     reset_channel_stats()
 
-    # Initialize STALE VIEWS (these get periodic updates)
+    # Initialize STALE VIEWS
     stale_stats = copy.deepcopy(channel_stats)
     last_global_update = 0.0
 
     device_stats = [copy.deepcopy(channel_stats) for _ in range(N)]
     last_device_update = [0.0 for _ in range(N)]
 
-    ongoing = [[] for _ in range(NUM_CHANNELS)]
+    NUM_CHANNELS = len(cluster_channels) * len(cluster_channels[0])
+    packets_by_channel = {ch: [] for ch in range(NUM_CHANNELS)}
     event_queue = []
-
-    # Insert packet arrivals
-    for t, dev in zip(arrivals, dev_sequence):
-        heapq.heappush(event_queue, (t, "arrival", dev))
 
     # Insert periodic global updates (Class B downlinks)
     if INFO_MODE in ["GLOBAL_DELAY", "HYBRID"]:
@@ -241,22 +248,22 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
             heapq.heappush(event_queue, (next_global, "global_update", None))
             next_global += GLOBAL_UPDATE_INTERVAL
 
-    success = 0
+    # Insert packet arrivals
+    for t, dev in zip(arrivals, dev_sequence):
+        heapq.heappush(event_queue, (t, "arrival", dev))
 
-    # -------------- MAIN EVENT LOOP --------------
+    # -------------- MAIN EVENT LOOP (for channel selection) --------------
     while event_queue:
         t, event_type, dev = heapq.heappop(event_queue)
 
-        # -------- DEVICE UPDATE EVENT (ACK downlink) --------
+        # -------- DEVICE UPDATE EVENT --------
         if event_type == "dev_update":
-            # Device receives updated stats via ACK downlink
             device_stats[dev] = copy.deepcopy(channel_stats)
             last_device_update[dev] = t
             continue
 
-        # -------- GLOBAL UPDATE EVENT (Class B downlink) --------
+        # -------- GLOBAL UPDATE EVENT --------
         if event_type == "global_update":
-            # Periodic broadcast to all devices
             stale_stats = copy.deepcopy(channel_stats)
             last_global_update = t
             continue
@@ -267,13 +274,12 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
             cluster_id = clusters[dev]
             allowed = cluster_channels[cluster_id]
 
-            # -------- DETERMINE WHICH STALE VIEW TO USE --------
+            # Determine which stale view to use
             if INFO_MODE == "GLOBAL_DELAY":
                 observed_stats = stale_stats
             elif INFO_MODE == "PER_DEVICE_DELAY":
                 observed_stats = device_stats[dev]
             elif INFO_MODE == "HYBRID":
-                # Use whichever is more recent
                 if last_device_update[dev] >= last_global_update:
                     observed_stats = device_stats[dev]
                 else:
@@ -281,75 +287,76 @@ def run_simulation(N, distances, RX, clusters, cluster_channels, select_channel_
             else:
                 raise ValueError("Invalid INFO_MODE")
 
-            # -------- CHANNEL SELECTION (uses STALE data) --------
-            channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats,N)
+            # Channel selection (uses STALE data)
+            channel, feat, score, prob = select_channel_fn(allowed, t, observed_stats, N)
 
-            # Remove expired transmissions
-            ongoing[channel] = [p for p in ongoing[channel] if p['end'] > t]
+            # Create packet
+            packet = {
+                'device_id': dev,
+                'start': t,
+                'end': t + PACKET_DURATION,
+                'rx': RX[dev],
+                'distance': d_dev,
+                'success': False
+            }
+            
+            packets_by_channel[channel].append(packet)
 
-            end_t = t + PACKET_DURATION
-
-           # -------- UPDATE GROUND TRUTH STATS (immediate) --------
+            # Update ground truth stats (for future selections)
             channel_stats[channel]['transmissions'] += 1
             channel_stats[channel]['last_used'] = t
 
-            # Check collision
-            ok = check_collision(ongoing[channel], t, end_t, RX[dev])
-
-            # ----- INSTANTANEOUS OUTCOME -----
-            inst_succ = 1.0 if ok else 0.0
-            inst_coll = 0.0 if ok else 1.0
-
-            # ----- UPDATE COUNTERS -----
-            if ok:
-                success += 1
-                channel_stats[channel]['successes'] += 1
-                channel_stats[channel]['ts_alpha'] += 1
-                success_distances.append(d_dev)
-            else:
-                channel_stats[channel]['collisions'] += 1
-                channel_stats[channel]['ts_beta'] += 1
-                failure_distances.append(d_dev)
-
-            # ----- UPDATE LONG-TERM EMA METRICS -----
-            BETA_SUCC  = 0.02
-            BETA_COLL  = 0.02
-            BETA_TREND = 0.05
-
-            # EMA success
-            channel_stats[channel]['ema_succ'] = \
-                (1.0 - BETA_SUCC) * channel_stats[channel]['ema_succ'] + \
-                BETA_SUCC * inst_succ
-
-            # EMA collision
-            channel_stats[channel]['ema_coll'] = \
-                (1.0 - BETA_COLL) * channel_stats[channel]['ema_coll'] + \
-                BETA_COLL * inst_coll
-
-            # Trend of TS success probability
-            p_ts_old = channel_stats[channel]['last_p_ts']
-            p_ts_new = channel_stats[channel]['ts_alpha'] / \
-                    (channel_stats[channel]['ts_alpha'] + channel_stats[channel]['ts_beta'])
-
-            delta_p = p_ts_new - p_ts_old
-            channel_stats[channel]['trend'] = \
-                (1.0 - BETA_TREND) * channel_stats[channel]['trend'] + \
-                BETA_TREND * delta_p
-
-            channel_stats[channel]['last_p_ts'] = p_ts_new
-
-            # ----- TS DECAY -----
-            if channel_stats[channel]['transmissions'] % 2000 == 0:
-                for ch2 in range(NUM_CHANNELS):
-                    channel_stats[ch2]['ts_alpha'] = max(1.0, channel_stats[ch2]['ts_alpha'] * 0.95)
-                    channel_stats[ch2]['ts_beta']  = max(1.0, channel_stats[ch2]['ts_beta']  * 0.95)
-
-            # -------- SCHEDULE DEVICE UPDATE (ACK downlink) -------
+            # Schedule device update (ACK downlink)
             update_time = t + DEVICE_UPDATE_DELAY
             heapq.heappush(event_queue, (update_time, "dev_update", dev))
 
-
-    return success / TOTAL_PACKETS, success_distances, failure_distances
+    # -------------- BATCH COLLISION EVALUATION --------------
+    for ch in range(NUM_CHANNELS):
+        check_collision_batch(packets_by_channel[ch])
+    
+    # Collect results and update statistics
+    all_packets = []
+    for ch in range(NUM_CHANNELS):
+        all_packets.extend(packets_by_channel[ch])
+        
+        # Update final statistics based on outcomes
+        for packet in packets_by_channel[ch]:
+            if packet['success']:
+                channel_stats[ch]['successes'] += 1
+                channel_stats[ch]['ts_alpha'] += 1
+            else:
+                channel_stats[ch]['collisions'] += 1
+                channel_stats[ch]['ts_beta'] += 1
+            
+            # Update long-term EMA metrics
+            inst_succ = 1.0 if packet['success'] else 0.0
+            inst_coll = 0.0 if packet['success'] else 1.0
+            
+            BETA_SUCC = 0.02
+            BETA_COLL = 0.02
+            BETA_TREND = 0.05
+            
+            channel_stats[ch]['ema_succ'] = \
+                (1.0 - BETA_SUCC) * channel_stats[ch]['ema_succ'] + BETA_SUCC * inst_succ
+            
+            channel_stats[ch]['ema_coll'] = \
+                (1.0 - BETA_COLL) * channel_stats[ch]['ema_coll'] + BETA_COLL * inst_coll
+            
+            p_ts_old = channel_stats[ch]['last_p_ts']
+            p_ts_new = channel_stats[ch]['ts_alpha'] / \
+                      (channel_stats[ch]['ts_alpha'] + channel_stats[ch]['ts_beta'])
+            
+            delta_p = p_ts_new - p_ts_old
+            channel_stats[ch]['trend'] = \
+                (1.0 - BETA_TREND) * channel_stats[ch]['trend'] + BETA_TREND * delta_p
+            
+            channel_stats[ch]['last_p_ts'] = p_ts_new
+    
+    success = sum(1 for p in all_packets if p['success'])
+    success_distances = [p['distance'] for p in all_packets if p['success']]
+    failure_distances = [p['distance'] for p in all_packets if not p['success']]
+    
+    return success / len(all_packets), success_distances, failure_distances
 
 # ----------------------------------------------------
 # PLOTTING FUNCTIONS

@@ -187,7 +187,7 @@ def optimize_clusters_with_GA(N, C, d, RX, positions, arrivals, dev_sequence):
 
     POP_SIZE = params["POP_SIZE"]
     GENERATIONS = params["GENERATIONS"]
-    MIN_GEN = 100                           # must run at least this many
+    MIN_GEN = GENERATIONS                           # must run at least this many
     MAX_GEN = GENERATIONS + 50                           # max generations
     EARLY_STOP_PATIENCE = 20                       # no improvement threshold
     MAX_MUT = params["MAX_MUT"]

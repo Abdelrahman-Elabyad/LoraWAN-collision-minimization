@@ -10,28 +10,48 @@ from clustering_channel_assignment import assign_clusters_random, assign_cluster
 from simulation import NUM_CHANNELS, PACKET_DURATION, MEAN_INTERARRIVAL
 
 RUN_PLAN = {
-    200: 1,
-    1000: 1,
-    6000: 1,
+    #200: 1,
+    #1000: 1,
+    #6000: 1,
     #10000: 1,
-    20000: 1,
-    46000: 1,
+    #20000: 1,
+    #46000: 1,
     #80000: 1,
     #100000: 1
 }
 
 CLUSTER_SIZES = [1,2,4]
 
-
 def aloha_theory_for_C(N, C):
-    """Calculate theoretical Slotted ALOHA success probability for given N and C."""
-    K = NUM_CHANNELS // C             # number of clusters
-    N_cluster = N / K                 # avg devices per cluster
-    lambda_cluster = N_cluster / MEAN_INTERARRIVAL     # arrivals/sec for cluster
-    lambda_per_ch = lambda_cluster / C                 # arrivals/sec per channel
-    G = lambda_per_ch * PACKET_DURATION
+    """
+    Calculate theoretical Pure ALOHA success probability for the entire system.
+    
+    This represents the theoretical baseline assuming:
+    - Perfect load balancing across all channels
+    - No capture effect
+    - Independent Pure ALOHA on each channel
+    
+    Args:
+        N: Number of devices
+        C: Channels per cluster (not used in calculation, kept for compatibility)
+    
+    Returns:
+        Theoretical success probability for the whole system
+    """
+    # Total system arrival rate (packets/second)
+    lambda_total = N / MEAN_INTERARRIVAL
+    
+    # Arrival rate per channel (assuming perfect load balancing across 8 channels)
+    lambda_per_channel = lambda_total / NUM_CHANNELS
+    
+    # Offered load G per channel
+    # For Pure ALOHA, vulnerable period is 2 * packet_duration
+    # G = arrival_rate * packet_duration
+    G = lambda_per_channel * PACKET_DURATION
+    
+    # Pure ALOHA success probability: P_success = e^(-2G)
+    # Factor of 2 accounts for the vulnerable period (before and after transmission)
     return math.exp(-2 * G)
-
 
 def save_cdf_plot(xs, ys, name):
     """Save CDF plot to file in cdf_plots directory."""
@@ -191,9 +211,7 @@ if __name__ == "__main__":
                 baseline_start = time.time()
                 clusters_rand = np.random.randint(0, 8//C, size=N)
                 reset_channel_stats()
-                randfull_score, _, _ = run_simulation(
-                    N, d, RX, clusters_rand, cluster_channels, random_select, arrivals, dev_sequence
-                )
+                randfull_score, _, _ = run_simulation(N, d, RX, clusters_rand, cluster_channels, random_select, arrivals, dev_sequence)
                 baseline_time = time.time() - baseline_start
                 print(f"[INFO] RandFull score: {randfull_score:.4f} (time: {baseline_time:.2f}s)")
 
@@ -204,9 +222,7 @@ if __name__ == "__main__":
                 quantile_start = time.time()
                 clusters_quant = assign_clusters_quantile_stratified(d, RX, C)
                 reset_channel_stats()
-                quantile_score, succ_quant, fail_quant = run_simulation(
-                    N, d, RX, clusters_quant, cluster_channels, random_select, arrivals, dev_sequence
-                )
+                quantile_score, succ_quant, fail_quant = run_simulation(N, d, RX, clusters_quant, cluster_channels, random_select, arrivals, dev_sequence)
                 quantile_time = time.time() - quantile_start
                 print(f"[INFO] Quantile score: {quantile_score:.4f} (time: {quantile_time:.2f}s)")
 
